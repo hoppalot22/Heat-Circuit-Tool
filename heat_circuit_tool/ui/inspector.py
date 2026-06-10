@@ -14,6 +14,7 @@ class ComponentInspector(ttk.Frame):
         ("name", "Name"),
         ("kind", "Component Type"),
         ("process_kind", "Process"),
+        ("inlet_definition_mode", "Inlet Definition"),
         ("inlet_pressure_mpa", "Inlet Pressure"),
         ("inlet_temperature_c", "Inlet Temperature"),
         ("inlet_enthalpy_kj_kg", "Inlet Enthalpy"),
@@ -21,6 +22,7 @@ class ComponentInspector(ttk.Frame):
         ("inlet_quality", "Inlet Quality"),
         ("inlet_specific_volume_m3_kg", "Inlet Specific Volume"),
         ("inlet_efficiency", "Inlet Efficiency"),
+        ("outlet_definition_mode", "Outlet Definition"),
         ("outlet_pressure_mpa", "Outlet Pressure"),
         ("outlet_temperature_c", "Outlet Temperature"),
         ("outlet_enthalpy_kj_kg", "Outlet Enthalpy"),
@@ -39,6 +41,68 @@ class ComponentInspector(ttk.Frame):
         ("local_loss_coefficient", "Local Loss Coefficient"),
         ("notes", "Notes"),
     ]
+
+    _base_fields = {"name", "kind", "process_kind", "notes"}
+    _definition_fields = {"inlet_definition_mode", "outlet_definition_mode"}
+    _inlet_state_fields = {
+        "inlet_pressure_mpa",
+        "inlet_temperature_c",
+        "inlet_enthalpy_kj_kg",
+        "inlet_entropy_kj_kgk",
+        "inlet_quality",
+        "inlet_specific_volume_m3_kg",
+    }
+    _outlet_state_fields = {
+        "outlet_pressure_mpa",
+        "outlet_temperature_c",
+        "outlet_enthalpy_kj_kg",
+        "outlet_entropy_kj_kgk",
+        "outlet_quality",
+        "outlet_specific_volume_m3_kg",
+    }
+    _definition_mode_map: dict[str, tuple[str, ...]] = {
+        "Auto": (
+            "pressure_mpa",
+            "temperature_c",
+            "enthalpy_kj_kg",
+            "entropy_kj_kgk",
+            "quality",
+            "specific_volume_m3_kg",
+        ),
+        "P + T": ("pressure_mpa", "temperature_c"),
+        "P + h": ("pressure_mpa", "enthalpy_kj_kg"),
+        "P + s": ("pressure_mpa", "entropy_kj_kgk"),
+        "P + x": ("pressure_mpa", "quality"),
+        "T + h": ("temperature_c", "enthalpy_kj_kg"),
+        "T + s": ("temperature_c", "entropy_kj_kgk"),
+        "T + x": ("temperature_c", "quality"),
+        "P + T + x": ("pressure_mpa", "temperature_c", "quality"),
+    }
+    _state_fields = {
+        "inlet_pressure_mpa",
+        "inlet_temperature_c",
+        "inlet_enthalpy_kj_kg",
+        "inlet_entropy_kj_kgk",
+        "inlet_quality",
+        "inlet_specific_volume_m3_kg",
+        "outlet_pressure_mpa",
+        "outlet_temperature_c",
+        "outlet_enthalpy_kj_kg",
+        "outlet_entropy_kj_kgk",
+        "outlet_quality",
+        "outlet_specific_volume_m3_kg",
+    }
+    _pipe_fields = {
+        "mass_flow_kg_s",
+        "pipe_length_m",
+        "pipe_outer_diameter_m",
+        "pipe_wall_thickness_m",
+        "pipe_roughness_m",
+        "elevation_change_m",
+        "local_loss_coefficient",
+        "pressure_drop_mpa",
+        "outlet_pressure_mpa",
+    }
 
     _neutral_bg = "#fcfcfc"
     _solver_bg = "#d7e7f5"
@@ -61,20 +125,25 @@ class ComponentInspector(ttk.Frame):
         self.on_dirty = on_dirty
         self.current_component_id: Optional[str] = None
         self._vars: dict[str, tk.StringVar] = {}
+        self._labels: dict[str, ttk.Label] = {}
         self._widgets: dict[str, tk.Widget] = {}
         self._colorable_fields: set[str] = set()
         self._unit_vars: dict[str, tk.StringVar] = {}
         self._unit_widgets: dict[str, ttk.Combobox] = {}
         self._unit_last: dict[str, str] = {}
+        self._active_fields: set[str] = set(self._base_fields)
         self._kind_values = [kind.value for kind in ComponentKind]
         self._process_values = [process.value for process in ProcessKind]
+        self._definition_modes = list(self._definition_mode_map.keys())
         self._loading = False
         self._solution_text = "Run the solver to see the cycle summary."
         self._build()
 
     def _build(self) -> None:
         for row, (field_name, label) in enumerate(self.field_specs):
-            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=2)
+            label_widget = ttk.Label(self, text=label)
+            label_widget.grid(row=row, column=0, sticky="w", padx=4, pady=2)
+            self._labels[field_name] = label_widget
             var = tk.StringVar()
             self._vars[field_name] = var
 
@@ -84,6 +153,10 @@ class ComponentInspector(ttk.Frame):
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name == "process_kind":
                 widget = ttk.Combobox(self, textvariable=var, values=self._process_values, state="readonly", width=22)
+                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                unit_widget = self._make_unit_placeholder(row)
+            elif field_name in {"inlet_definition_mode", "outlet_definition_mode"}:
+                widget = ttk.Combobox(self, textvariable=var, values=self._definition_modes, state="readonly", width=22)
                 widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name == "notes":
@@ -106,6 +179,65 @@ class ComponentInspector(ttk.Frame):
         button_row = len(self.field_specs)
         ttk.Button(self, text="Apply to Component", command=self.apply_to_component).grid(row=button_row, column=0, columnspan=3, sticky="ew", padx=4, pady=(10, 2))
         ttk.Button(self, text="Solve Circuit", command=self.solve_requested).grid(row=button_row + 1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+
+    def _definition_fields_for_mode(self, prefix: str, mode: str) -> set[str]:
+        suffixes = self._definition_mode_map.get(mode, self._definition_mode_map["Auto"])
+        return {f"{prefix}_{suffix}" for suffix in suffixes}
+
+    def _active_fields_for(self, kind: ComponentKind, process: ProcessKind, inlet_mode: str, outlet_mode: str) -> set[str]:
+        fields = set(self._base_fields) | set(self._definition_fields)
+        inlet_mode_fields = self._definition_fields_for_mode("inlet", inlet_mode)
+        outlet_mode_fields = self._definition_fields_for_mode("outlet", outlet_mode)
+        if kind in {ComponentKind.PUMP, ComponentKind.TURBINE}:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= {"outlet_efficiency", "inlet_efficiency", "pressure_drop_mpa"}
+            return fields
+        if kind in {ComponentKind.BOILER, ComponentKind.REHEATER, ComponentKind.CONDENSER, ComponentKind.HEAT_EXCHANGER}:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= {"heat_duty_kw", "pressure_drop_mpa"}
+            return fields
+        if kind == ComponentKind.VALVE:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= {"pressure_drop_mpa"}
+            return fields
+        if kind == ComponentKind.PIPE:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= self._pipe_fields
+            return fields
+        if kind in {ComponentKind.MIXER, ComponentKind.SPLITTER}:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= {"pressure_drop_mpa"}
+            return fields
+        if process == ProcessKind.GENERAL or kind == ComponentKind.CUSTOM:
+            fields |= (self._inlet_state_fields & inlet_mode_fields)
+            fields |= (self._outlet_state_fields & outlet_mode_fields)
+            fields |= {"pressure_drop_mpa", "outlet_efficiency", "heat_duty_kw"}
+            return fields
+        fields |= (self._inlet_state_fields & inlet_mode_fields)
+        fields |= (self._outlet_state_fields & outlet_mode_fields)
+        fields |= {"pressure_drop_mpa", "outlet_efficiency"}
+        return fields
+
+    def _update_field_visibility(self, kind: ComponentKind, process: ProcessKind, inlet_mode: str, outlet_mode: str) -> None:
+        self._active_fields = self._active_fields_for(kind, process, inlet_mode, outlet_mode)
+        for field_name, _ in self.field_specs:
+            visible = field_name in self._active_fields
+            label = self._labels[field_name]
+            widget = self._widgets[field_name]
+            unit_widget = self._unit_widgets[field_name]
+            if visible:
+                label.grid()
+                widget.grid()
+                unit_widget.grid()
+            else:
+                label.grid_remove()
+                widget.grid_remove()
+                unit_widget.grid_remove()
 
     def _make_unit_placeholder(self, row: int) -> ttk.Combobox:
         unit_var = tk.StringVar(value="-")
@@ -134,16 +266,27 @@ class ComponentInspector(ttk.Frame):
                     widget = self._widgets.get(key)
                     if widget is not None:
                         widget.configure(bg=self._neutral_bg)
+            self._vars["inlet_definition_mode"].set("Auto")
+            self._vars["outlet_definition_mode"].set("Auto")
+            self._update_field_visibility(ComponentKind.CUSTOM, ProcessKind.GENERAL, "Auto", "Auto")
             self._loading = False
             return
 
         component = self.circuit.components[component_id]
         self._ensure_unit_prefs(component)
+        self._update_field_visibility(
+            component.kind,
+            component.process_kind,
+            component.inlet_definition_mode,
+            component.outlet_definition_mode,
+        )
 
         values = {
             "name": component.name,
             "kind": component.kind.value,
             "process_kind": component.process_kind.value,
+            "inlet_definition_mode": component.inlet_definition_mode,
+            "outlet_definition_mode": component.outlet_definition_mode,
             "inlet_pressure_mpa": component.inlet_spec.pressure_mpa,
             "inlet_temperature_c": component.inlet_spec.temperature_c,
             "inlet_enthalpy_kj_kg": component.inlet_spec.enthalpy_kj_kg,
@@ -195,35 +338,56 @@ class ComponentInspector(ttk.Frame):
         component.name = self._vars["name"].get().strip() or component.name
         component.kind = ComponentKind(self._vars["kind"].get().strip() or component.kind.value)
         component.process_kind = ProcessKind(self._vars["process_kind"].get().strip() or component.process_kind.value)
+        component.inlet_definition_mode = self._vars["inlet_definition_mode"].get().strip() or "Auto"
+        component.outlet_definition_mode = self._vars["outlet_definition_mode"].get().strip() or "Auto"
+        self._update_field_visibility(
+            component.kind,
+            component.process_kind,
+            component.inlet_definition_mode,
+            component.outlet_definition_mode,
+        )
 
         component.solved_fields.clear()
 
+        active = self._active_fields_for(
+            component.kind,
+            component.process_kind,
+            component.inlet_definition_mode,
+            component.outlet_definition_mode,
+        )
+
+        def parse_active(field_name: str) -> float | None:
+            if field_name in active:
+                return self._parse_and_track(component, field_name)
+            component.user_input_fields.discard(field_name)
+            return None
+
         component.inlet_spec = ThermoSpec(
-            pressure_mpa=self._parse_and_track(component, "inlet_pressure_mpa"),
-            temperature_c=self._parse_and_track(component, "inlet_temperature_c"),
-            enthalpy_kj_kg=self._parse_and_track(component, "inlet_enthalpy_kj_kg"),
-            entropy_kj_kgk=self._parse_and_track(component, "inlet_entropy_kj_kgk"),
-            quality=self._parse_and_track(component, "inlet_quality"),
-            specific_volume_m3_kg=self._parse_and_track(component, "inlet_specific_volume_m3_kg"),
-            efficiency=self._parse_and_track(component, "inlet_efficiency"),
+            pressure_mpa=parse_active("inlet_pressure_mpa"),
+            temperature_c=parse_active("inlet_temperature_c"),
+            enthalpy_kj_kg=parse_active("inlet_enthalpy_kj_kg"),
+            entropy_kj_kgk=parse_active("inlet_entropy_kj_kgk"),
+            quality=parse_active("inlet_quality"),
+            specific_volume_m3_kg=parse_active("inlet_specific_volume_m3_kg"),
+            efficiency=parse_active("inlet_efficiency"),
         )
         component.outlet_spec = ThermoSpec(
-            pressure_mpa=self._parse_and_track(component, "outlet_pressure_mpa"),
-            temperature_c=self._parse_and_track(component, "outlet_temperature_c"),
-            enthalpy_kj_kg=self._parse_and_track(component, "outlet_enthalpy_kj_kg"),
-            entropy_kj_kgk=self._parse_and_track(component, "outlet_entropy_kj_kgk"),
-            quality=self._parse_and_track(component, "outlet_quality"),
-            specific_volume_m3_kg=self._parse_and_track(component, "outlet_specific_volume_m3_kg"),
-            efficiency=self._parse_and_track(component, "outlet_efficiency"),
-            heat_duty_kw=self._parse_and_track(component, "heat_duty_kw"),
-            pressure_drop_mpa=self._parse_and_track(component, "pressure_drop_mpa"),
-            mass_flow_kg_s=self._parse_and_track(component, "mass_flow_kg_s"),
-            pipe_length_m=self._parse_and_track(component, "pipe_length_m"),
-            pipe_outer_diameter_m=self._parse_and_track(component, "pipe_outer_diameter_m"),
-            pipe_wall_thickness_m=self._parse_and_track(component, "pipe_wall_thickness_m"),
-            pipe_roughness_m=self._parse_and_track(component, "pipe_roughness_m"),
-            elevation_change_m=self._parse_and_track(component, "elevation_change_m"),
-            local_loss_coefficient=self._parse_and_track(component, "local_loss_coefficient"),
+            pressure_mpa=parse_active("outlet_pressure_mpa"),
+            temperature_c=parse_active("outlet_temperature_c"),
+            enthalpy_kj_kg=parse_active("outlet_enthalpy_kj_kg"),
+            entropy_kj_kgk=parse_active("outlet_entropy_kj_kgk"),
+            quality=parse_active("outlet_quality"),
+            specific_volume_m3_kg=parse_active("outlet_specific_volume_m3_kg"),
+            efficiency=parse_active("outlet_efficiency"),
+            heat_duty_kw=parse_active("heat_duty_kw"),
+            pressure_drop_mpa=parse_active("pressure_drop_mpa"),
+            mass_flow_kg_s=parse_active("mass_flow_kg_s"),
+            pipe_length_m=parse_active("pipe_length_m"),
+            pipe_outer_diameter_m=parse_active("pipe_outer_diameter_m"),
+            pipe_wall_thickness_m=parse_active("pipe_wall_thickness_m"),
+            pipe_roughness_m=parse_active("pipe_roughness_m"),
+            elevation_change_m=parse_active("elevation_change_m"),
+            local_loss_coefficient=parse_active("local_loss_coefficient"),
         )
         component.notes = self._vars["notes"].get().strip()
         component.is_dirty = True
@@ -377,15 +541,33 @@ class ComponentInspector(ttk.Frame):
                 pass
         component.unit_preferences[field_name] = new_unit
         self._unit_last[field_name] = new_unit
-        component.user_input_fields.add(field_name)
+        if self._vars[field_name].get().strip():
+            component.user_input_fields.add(field_name)
+        else:
+            component.user_input_fields.discard(field_name)
         self._clear_highlights_dirty(component)
 
     def _on_any_field_modified(self, field_name: str) -> None:
         if self._loading or self.current_component_id is None:
             return
         component = self.circuit.components[self.current_component_id]
+        if field_name in {"kind", "process_kind", "inlet_definition_mode", "outlet_definition_mode"}:
+            try:
+                kind = ComponentKind(self._vars["kind"].get().strip() or component.kind.value)
+            except Exception:
+                kind = component.kind
+            try:
+                process = ProcessKind(self._vars["process_kind"].get().strip() or component.process_kind.value)
+            except Exception:
+                process = component.process_kind
+            inlet_mode = self._vars["inlet_definition_mode"].get().strip() or component.inlet_definition_mode
+            outlet_mode = self._vars["outlet_definition_mode"].get().strip() or component.outlet_definition_mode
+            self._update_field_visibility(kind, process, inlet_mode, outlet_mode)
         if is_numeric_field(field_name):
-            component.user_input_fields.add(field_name)
+            if self._vars[field_name].get().strip():
+                component.user_input_fields.add(field_name)
+            else:
+                component.user_input_fields.discard(field_name)
         self._clear_highlights_dirty(component)
 
     def _clear_highlights_dirty(self, component) -> None:
@@ -397,8 +579,11 @@ class ComponentInspector(ttk.Frame):
             self.on_dirty()
 
     def _apply_highlights(self, component) -> None:
+        overdefined = self._is_overdefined_for_non_general(component)
         for field_name in self._colorable_fields:
             widget = self._widgets[field_name]
+            if field_name not in self._active_fields:
+                continue
             color = self._neutral_bg
             if field_name in component.user_input_fields:
                 color = self._input_bg
@@ -407,6 +592,35 @@ class ComponentInspector(ttk.Frame):
             if field_name in component.conflicting_fields:
                 color = self._conflict_bg
             widget.configure(bg=color)
+
+        for field_name, label in self._labels.items():
+            if field_name not in self._active_fields:
+                continue
+            highlight_field = field_name in self._inlet_state_fields or field_name in self._outlet_state_fields
+            if overdefined and highlight_field:
+                label.configure(foreground="#ff5a5a")
+            else:
+                label.configure(foreground="#e9eef7")
+
+    def _is_overdefined_for_non_general(self, component) -> bool:
+        if component.process_kind == ProcessKind.GENERAL:
+            return False
+        inlet_mode_var = self._vars.get("inlet_definition_mode")
+        outlet_mode_var = self._vars.get("outlet_definition_mode")
+        inlet_mode = (inlet_mode_var.get() if inlet_mode_var is not None else "") or component.inlet_definition_mode
+        outlet_mode = (outlet_mode_var.get() if outlet_mode_var is not None else "") or component.outlet_definition_mode
+        inlet_required = self._definition_fields_for_mode("inlet", inlet_mode)
+        outlet_required = self._definition_fields_for_mode("outlet", outlet_mode)
+
+        def complete(required: set[str]) -> bool:
+            for field_name in required:
+                if field_name not in self._active_fields:
+                    continue
+                if not self._vars[field_name].get().strip():
+                    return False
+            return True
+
+        return complete(inlet_required) and complete(outlet_required)
 
     def solve_requested(self) -> None:
         if self.on_solve:

@@ -142,6 +142,8 @@ class Component:
     inlet_state: Optional[ThermoState] = None
     outlet_state: Optional[ThermoState] = None
     unit_preferences: dict[str, str] = field(default_factory=dict)
+    inlet_definition_mode: str = "Auto"
+    outlet_definition_mode: str = "Auto"
     user_input_fields: set[str] = field(default_factory=set)
     solved_fields: set[str] = field(default_factory=set)
     conflicting_fields: set[str] = field(default_factory=set)

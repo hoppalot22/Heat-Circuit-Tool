@@ -11,18 +11,23 @@ from ..model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
 from ..persistence import circuit_from_dict, circuit_to_dict, load_project_file, save_project_file
 from ..presets import PRESETS, apply_preset, preset_names
 from ..solve_logging import append_solve_log
-from ..solver import CircuitSolution, SolverError, solve_circuit
+from ..solver import ConstraintDiagnostics, CircuitSolution, SolverError, analyze_constraint_system, solve_circuit
 from .canvas import NodeCanvas
 from .cycle_diagram import CycleDiagramPanel
 from .inspector import ComponentInspector
+from ..unit_system import default_unit
 
 
 class HeatCircuitApp(ttk.Frame):
     def __init__(self, master: tk.Misc):
         super().__init__(master)
         self.master.title("Heat Circuit Tool")
-        self.master.geometry("1680x980")
-        self.master.minsize(1400, 860)
+        screen_w = max(int(self.master.winfo_screenwidth()), 800)
+        screen_h = max(int(self.master.winfo_screenheight()), 600)
+        launch_w = max(screen_w // 2, 480)
+        launch_h = max(screen_h // 2, 320)
+        self.master.geometry(f"{launch_w}x{launch_h}")
+        self.master.minsize(480, 320)
         self.circuit = build_reheat_rankine_demo()
         self._selection_id: Optional[str] = None
         self._latest_solved_snapshot: dict | None = None
@@ -30,6 +35,8 @@ class HeatCircuitApp(ttk.Frame):
         self._project_path: str | None = None
         self._project_log_path: str = self._derive_log_path(None)
         self._last_solution: CircuitSolution | None = None
+        self._constraint_diagnostics: ConstraintDiagnostics = ConstraintDiagnostics(system_status="Unknown")
+        self._last_solver_error: str | None = None
         self._library_collapsed = False
         self._inspector_collapsed = False
         self._results_collapsed = False
@@ -44,10 +51,37 @@ class HeatCircuitApp(ttk.Frame):
         self._inspector_popup_host: ttk.Frame | None = None
         self._popup_results_scroll: ttk.Scrollbar | None = None
         self._active_wheel_target: str | None = None
+        self._apply_seed_as_user_constraints()
         self._build_style()
         self._build_ui()
         self.pack(fill="both", expand=True)
         self.refresh_all()
+
+    def _apply_seed_as_user_constraints(self) -> None:
+        if self.circuit.start_component_id is None or self.circuit.seed_state is None:
+            return
+        component = self.circuit.components.get(self.circuit.start_component_id)
+        if component is None:
+            return
+        seed = self.circuit.seed_state
+        component.inlet_spec.pressure_mpa = seed.pressure_mpa
+        component.inlet_spec.temperature_c = seed.temperature_c
+        component.inlet_spec.enthalpy_kj_kg = seed.enthalpy_kj_kg
+        component.inlet_spec.entropy_kj_kgk = seed.entropy_kj_kgk
+        component.inlet_spec.specific_volume_m3_kg = seed.specific_volume_m3_kg
+        component.inlet_spec.quality = seed.quality
+
+        seeded_fields = {
+            "inlet_pressure_mpa",
+            "inlet_temperature_c",
+            "inlet_enthalpy_kj_kg",
+            "inlet_entropy_kj_kgk",
+            "inlet_specific_volume_m3_kg",
+            "inlet_quality",
+        }
+        component.user_input_fields.update(seeded_fields)
+        for field_name in seeded_fields:
+            component.unit_preferences.setdefault(field_name, default_unit(field_name))
 
     def _derive_log_path(self, project_path: str | None) -> str:
         if not project_path:
@@ -238,9 +272,24 @@ class HeatCircuitApp(ttk.Frame):
         self.cycle_diagram.grid(row=0, column=0, sticky="nsew")
 
         self.status = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(self, textvariable=self.status, anchor="w")
-        status_bar.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.constraint_badge = tk.StringVar(value="Constraint: Unknown")
+        footer = ttk.Frame(self)
+        footer.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        footer.columnconfigure(0, weight=1)
+        status_bar = ttk.Label(footer, textvariable=self.status, anchor="w")
+        status_bar.grid(row=0, column=0, sticky="ew")
+        self.constraint_badge_label = tk.Label(
+            footer,
+            textvariable=self.constraint_badge,
+            bg="#59606b",
+            fg="#ffffff",
+            padx=8,
+            pady=3,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.constraint_badge_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
         self._refresh_panel_button_labels()
+        self._update_live_diagnostics()
 
     def _build_insert_menu(self) -> None:
         menu_bar = tk.Menu(self.master)
@@ -270,6 +319,7 @@ class HeatCircuitApp(ttk.Frame):
         self.inspector.load_component(self._selection_id)
         if self._popup_inspector:
             self._popup_inspector.load_component(self._selection_id)
+        self._update_live_diagnostics()
         self._refresh_results_text(None)
         self.cycle_diagram.set_solution(self.circuit, self._last_solution)
 
@@ -352,13 +402,23 @@ class HeatCircuitApp(ttk.Frame):
         if self._popup_inspector is not None:
             self._popup_inspector.apply_to_component()
         self.inspector.apply_to_component()
+        self._prepare_circuit_for_user_constrained_solve()
+        self._last_solver_error = None
         try:
             solution = solve_circuit(self.circuit)
         except SolverError as exc:
+            self._last_solver_error = str(exc)
+            self._last_solution = None
+            self._update_live_diagnostics()
+            self._refresh_results_text(None)
             messagebox.showerror("Solve failed", str(exc))
             self.status.set("Solve failed")
             return
         except Exception as exc:  # pragma: no cover - runtime safety
+            self._last_solver_error = str(exc)
+            self._last_solution = None
+            self._update_live_diagnostics()
+            self._refresh_results_text(None)
             messagebox.showerror("Solve failed", str(exc))
             self.status.set("Solve failed")
             return
@@ -390,6 +450,7 @@ class HeatCircuitApp(ttk.Frame):
             append_solve_log(self._project_log_path, self.circuit, solution)
         except Exception as exc:  # pragma: no cover - non-fatal logging path
             solution.messages.append(f"Solve log write failed: {exc}")
+        self._update_live_diagnostics()
         self.canvas.redraw()
         if solution.system_status == "Overconstrained":
             self.status.set("Solve complete: system overconstrained (see red fields and results)")
@@ -398,10 +459,59 @@ class HeatCircuitApp(ttk.Frame):
         else:
             self.status.set("Circuit solved successfully")
 
+    def _prepare_circuit_for_user_constrained_solve(self) -> None:
+        # Remove any solver-populated values so each solve uses only current user constraints.
+        inlet_fields = [
+            "pressure_mpa",
+            "temperature_c",
+            "enthalpy_kj_kg",
+            "entropy_kj_kgk",
+            "quality",
+            "specific_volume_m3_kg",
+            "efficiency",
+        ]
+        outlet_fields = [
+            "pressure_mpa",
+            "temperature_c",
+            "enthalpy_kj_kg",
+            "entropy_kj_kgk",
+            "quality",
+            "specific_volume_m3_kg",
+            "efficiency",
+            "heat_duty_kw",
+            "pressure_drop_mpa",
+            "mass_flow_kg_s",
+            "pipe_length_m",
+            "pipe_outer_diameter_m",
+            "pipe_wall_thickness_m",
+            "pipe_roughness_m",
+            "elevation_change_m",
+            "local_loss_coefficient",
+        ]
+
+        for component in self.circuit.components.values():
+            user_fields = component.user_input_fields
+            for field_name in inlet_fields:
+                scoped = f"inlet_{field_name}"
+                if scoped not in user_fields:
+                    setattr(component.inlet_spec, field_name, None)
+            for field_name in outlet_fields:
+                scoped = f"outlet_{field_name}"
+                if scoped not in user_fields and field_name not in user_fields:
+                    setattr(component.outlet_spec, field_name, None)
+
+            component.inlet_state = None
+            component.outlet_state = None
+            component.report = ""
+            component.solved_fields.clear()
+            component.conflicting_fields.clear()
+            component.is_dirty = True
+
     def _on_inspector_apply(self) -> None:
         self.canvas.redraw()
         if self._popup_inspector and self._selection_id:
             self._popup_inspector.load_component(self._selection_id)
+        self._update_live_diagnostics()
         if self._selection_id and self._selection_id in self.circuit.components:
             component = self.circuit.components[self._selection_id]
             self.status.set(f"Updated {component.name}")
@@ -409,12 +519,23 @@ class HeatCircuitApp(ttk.Frame):
     def _on_inspector_dirty(self) -> None:
         self.status.set("Model modified: solve required")
         self.canvas.redraw()
+        self._last_solution = None
+        self._update_live_diagnostics()
+        self._refresh_results_text(None)
 
     def _refresh_results_text(self, solution: CircuitSolution | None) -> None:
         if solution is None:
             text = self.inspector.solution_text()
         else:
             text = self.inspector.solution_text()
+        diagnostics_lines = ["", "Live Diagnostics", "----------------", *self._constraint_diagnostics.summary_lines(), ""]
+        for item in self._constraint_diagnostics.component_diagnostics:
+            diagnostics_lines.append(
+                f"{item.component_name}: {item.status} | needs {item.additional_info_required} | {item.message}"
+            )
+        if self._last_solver_error:
+            diagnostics_lines.extend(["", "Last Solve Error", "----------------", self._last_solver_error])
+        text = text + "\n".join(diagnostics_lines)
         self.results_text.configure(state="normal")
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", text)
@@ -428,6 +549,7 @@ class HeatCircuitApp(ttk.Frame):
     def load_demo(self) -> None:
         self.circuit = build_reheat_rankine_demo()
         self._last_solution = None
+        self._apply_seed_as_user_constraints()
         self.canvas.set_circuit(self.circuit)
         self.inspector.circuit = self.circuit
         if self._popup_inspector:
@@ -435,6 +557,8 @@ class HeatCircuitApp(ttk.Frame):
         self.cycle_diagram.set_solution(self.circuit, None)
         self._selection_id = self.circuit.start_component_id
         self.canvas.select_component(self._selection_id)
+        self._last_solver_error = None
+        self._update_live_diagnostics()
         self.status.set("Loaded reheat Rankine cycle demo")
 
     def revert_latest_solve(self) -> None:
@@ -442,6 +566,8 @@ class HeatCircuitApp(ttk.Frame):
             self.status.set("No solved state cached yet")
             return
         self._restore_circuit_dict(copy.deepcopy(self._latest_solved_snapshot))
+        self._last_solver_error = None
+        self._update_live_diagnostics()
         self.status.set("Reverted to latest solved state")
 
     def save_snapshot(self) -> None:
@@ -523,19 +649,34 @@ class HeatCircuitApp(ttk.Frame):
         self._project_path = path
         self._project_log_path = self._derive_log_path(path)
         self.cycle_diagram.set_solution(self.circuit, None)
+        self._last_solver_error = None
+        self._update_live_diagnostics()
         self.status.set(f"Project loaded: {path}")
 
     def _restore_circuit_dict(self, circuit_dict: dict) -> None:
         self.circuit = circuit_from_dict(circuit_dict)
         self._last_solution = None
+        self._apply_seed_as_user_constraints()
         self.canvas.set_circuit(self.circuit)
         self.inspector.circuit = self.circuit
         if self._popup_inspector:
             self._popup_inspector.circuit = self.circuit
         self._selection_id = self.circuit.start_component_id
         self.canvas.select_component(self._selection_id)
+        self._update_live_diagnostics()
         self._refresh_results_text(None)
         self.cycle_diagram.set_solution(self.circuit, None)
+
+    def _update_live_diagnostics(self) -> None:
+        self._constraint_diagnostics = analyze_constraint_system(self.circuit)
+        status = self._constraint_diagnostics.system_status
+        self.constraint_badge.set(f"Constraint: {status}")
+        if status == "Well-defined":
+            self.constraint_badge_label.configure(bg="#1f8f4d", fg="#ffffff")
+        elif status == "Overconstrained":
+            self.constraint_badge_label.configure(bg="#b83a3a", fg="#ffffff")
+        else:
+            self.constraint_badge_label.configure(bg="#b37a1f", fg="#ffffff")
 
     def _pane_contains(self, pane: tk.PanedWindow, widget: tk.Widget) -> bool:
         widget_name = str(widget)

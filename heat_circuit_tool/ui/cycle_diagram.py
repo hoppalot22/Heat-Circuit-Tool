@@ -40,6 +40,8 @@ class CycleDiagramPanel(ttk.Frame):
         self._label_to_key = {spec.label: spec.key for spec in AXIS_OPTIONS}
         self._key_to_label = {spec.key: spec.label for spec in AXIS_OPTIONS}
         self._placed_label_points: list[tuple[float, float]] = []
+        self._placed_label_boxes: list[tuple[float, float, float, float]] = []
+        self._occupied_points: list[tuple[float, float]] = []
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -92,6 +94,8 @@ class CycleDiagramPanel(ttk.Frame):
         self.ax.clear()
         self.ax.grid(True, alpha=0.3)
         self._placed_label_points = []
+        self._placed_label_boxes = []
+        self._occupied_points = []
 
         x_key = self._label_to_key[self.x_axis_var.get()]
         y_key = self._label_to_key[self.y_axis_var.get()]
@@ -130,6 +134,33 @@ class CycleDiagramPanel(ttk.Frame):
                 return False
         return True
 
+    def _approx_text_box(self, x: float, y: float, text: str, fontsize: int, x_span: float, y_span: float) -> tuple[float, float, float, float]:
+        char_count = max(len(text), 1)
+        width_frac = min(0.45, 0.0095 * char_count)
+        height_frac = min(0.16, 0.03 + 0.0028 * fontsize)
+        half_w = 0.5 * width_frac * x_span
+        half_h = 0.5 * height_frac * y_span
+        return (x - half_w, y - half_h, x + half_w, y + half_h)
+
+    def _boxes_overlap(self, a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+    def _label_box_is_clear(self, box: tuple[float, float, float, float], x_span: float, y_span: float) -> bool:
+        margin_x = 0.015 * max(x_span, 1.0)
+        margin_y = 0.015 * max(y_span, 1.0)
+        expanded = (box[0] - margin_x, box[1] - margin_y, box[2] + margin_x, box[3] + margin_y)
+        for existing in self._placed_label_boxes:
+            if self._boxes_overlap(expanded, existing):
+                return False
+        min_dx = 0.02 * max(x_span, 1.0)
+        min_dy = 0.02 * max(y_span, 1.0)
+        cx = 0.5 * (box[0] + box[2])
+        cy = 0.5 * (box[1] + box[3])
+        for px, py in self._occupied_points:
+            if abs(cx - px) < min_dx and abs(cy - py) < min_dy:
+                return False
+        return True
+
     def _place_label_near(
         self,
         base_x: float,
@@ -151,16 +182,24 @@ class CycleDiagramPanel(ttk.Frame):
             (-0.012 * x_span, -0.012 * y_span),
             (0.02 * x_span, 0.0),
             (-0.02 * x_span, 0.0),
+            (0.0, 0.02 * y_span),
+            (0.0, -0.02 * y_span),
+            (0.03 * x_span, 0.015 * y_span),
+            (-0.03 * x_span, -0.015 * y_span),
         ]
         for dx, dy in candidates:
             cx = base_x + dx
             cy = base_y + dy
-            if self._is_far_from_labels(cx, cy, x_span, y_span):
+            box = self._approx_text_box(cx, cy, text, fontsize, x_span, y_span)
+            if self._is_far_from_labels(cx, cy, x_span, y_span) and self._label_box_is_clear(box, x_span, y_span):
                 self.ax.annotate(text, (cx, cy), fontsize=fontsize, alpha=0.92, color=color, ha=align)
                 self._placed_label_points.append((cx, cy))
+                self._placed_label_boxes.append(box)
                 return
+        fallback_box = self._approx_text_box(base_x, base_y, text, fontsize, x_span, y_span)
         self.ax.annotate(text, (base_x, base_y), fontsize=fontsize, alpha=0.85, color=color, ha=align)
         self._placed_label_points.append((base_x, base_y))
+        self._placed_label_boxes.append(fallback_box)
 
     def _draw_legend(self) -> None:
         handles = [
@@ -187,6 +226,7 @@ class CycleDiagramPanel(ttk.Frame):
                 y1 = self._value(inlet, y_key)
                 x2 = self._value(outlet, x_key)
                 y2 = self._value(outlet, y_key)
+                self._occupied_points.extend([(x1, y1), (x2, y2)])
                 self.ax.plot([x1, x2], [y1, y2], color="#1f77b4", linewidth=2.0)
                 self.ax.scatter([x1, x2], [y1, y2], s=20, color="#1f77b4")
 
@@ -214,6 +254,7 @@ class CycleDiagramPanel(ttk.Frame):
                 for downstream_id in self._circuit.outgoing(result.component_id):
                     x = self._value(outlet, x_key)
                     y = self._value(outlet, y_key)
+                    self._occupied_points.append((x, y))
                     self.ax.scatter([x], [y], s=36, marker="o", edgecolor="#111111", facecolor="#ffd166", zorder=5)
                     self.ax.annotate(str(point_index), (x, y), fontsize=7, color="#111111")
                     point_index += 1

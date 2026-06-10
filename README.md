@@ -2,6 +2,11 @@
 
 Heat Circuit Tool is a modular desktop app for creating, connecting, and solving thermal process circuits with steam properties.
 
+## Documentation
+
+- Developer docs index: docs/README.md
+- Full Python API reference: docs/PYTHON_API_REFERENCE.md
+
 It is designed so you can:
 - Build a flowsheet visually using draggable component blocks.
 - Connect components with inlet and outlet node links.
