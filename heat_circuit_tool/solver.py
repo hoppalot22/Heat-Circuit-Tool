@@ -141,12 +141,6 @@ class ThermoSolver:
             for component in order:
                 inlet_state = self._resolve_inlet_state(circuit, component)
                 outlet_state_hint = self._resolve_outlet_state(circuit, component)
-                if (
-                    component.component_id == circuit.start_component_id
-                    and outlet_state_hint is not None
-                    and self._state_from_thermo_spec(component.inlet_spec) is None
-                ):
-                    inlet_state = None
                 if inlet_state is None and outlet_state_hint is None:
                     continue
                 previous_inlet = component.inlet_state
