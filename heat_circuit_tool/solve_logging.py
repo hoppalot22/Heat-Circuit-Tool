@@ -7,29 +7,17 @@ from typing import Any
 
 from .model import Circuit
 from .solver import CircuitSolution
-from .thermo import ThermoState
-
-
-def _state_to_dict(state: ThermoState | None) -> dict[str, Any] | None:
-    if state is None:
-        return None
-    return {
-        "pressure_mpa": state.pressure_mpa,
-        "temperature_c": state.temperature_c,
-        "enthalpy_kj_kg": state.enthalpy_kj_kg,
-        "entropy_kj_kgk": state.entropy_kj_kgk,
-        "specific_volume_m3_kg": state.specific_volume_m3_kg,
-        "dynamic_viscosity_pa_s": state.dynamic_viscosity_pa_s,
-        "quality": state.quality,
-    }
+from .thermo import state_to_dict
 
 
 def _component_debug(circuit: Circuit) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for component in circuit.components.values():
+        cid = component.component_id
+        ui = circuit.ui_states.get(cid)
         rows.append(
             {
-                "component_id": component.component_id,
+                "component_id": cid,
                 "name": component.name,
                 "kind": component.kind.value,
                 "process_kind": component.process_kind.value,
@@ -37,13 +25,13 @@ def _component_debug(circuit: Circuit) -> list[dict[str, Any]]:
                 "downstream_ids": list(component.downstream_ids),
                 "inlet_spec": component.inlet_spec.pretty(),
                 "outlet_spec": component.outlet_spec.pretty(),
-                "unit_preferences": dict(component.unit_preferences),
+                "unit_preferences": dict(ui.unit_preferences) if ui else {},
                 "user_input_fields": sorted(component.user_input_fields),
-                "solved_fields": sorted(component.solved_fields),
-                "conflicting_fields": sorted(component.conflicting_fields),
-                "report": component.report,
-                "inlet_state": _state_to_dict(component.inlet_state),
-                "outlet_state": _state_to_dict(component.outlet_state),
+                "solved_fields": sorted(ui.solved_fields) if ui else set(),
+                "conflicting_fields": sorted(ui.conflicting_fields) if ui else set(),
+                "report": ui.report if ui else "",
+                "inlet_state": state_to_dict(component.inlet_state),
+                "outlet_state": state_to_dict(component.outlet_state),
             }
         )
     return rows
@@ -80,8 +68,8 @@ def append_solve_log(log_file_path: str, circuit: Circuit, solution: CircuitSolu
                 "work_kj_kg": result.work_kj_kg,
                 "heat_kj_kg": result.heat_kj_kg,
                 "message": result.message,
-                "inlet_state": _state_to_dict(result.inlet_state),
-                "outlet_state": _state_to_dict(result.outlet_state),
+                "inlet_state": state_to_dict(result.inlet_state),
+                "outlet_state": state_to_dict(result.outlet_state),
             }
             for result in solution.component_results
         ],
@@ -91,7 +79,7 @@ def append_solve_log(log_file_path: str, circuit: Circuit, solution: CircuitSolu
         entry["debug"] = {
             "start_component_id": circuit.start_component_id,
             "seed_description": circuit.seed_description,
-            "seed_state": _state_to_dict(circuit.seed_state),
+            "seed_state": state_to_dict(circuit.seed_state),
             "underconstrained_components": list(solution.underconstrained_components),
             "overconstrained_components": list(solution.overconstrained_components),
             "unsolved_components": list(solution.unsolved_components),

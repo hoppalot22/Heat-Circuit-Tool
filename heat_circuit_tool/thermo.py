@@ -94,6 +94,34 @@ class StateSpec:
         return ", ".join(fields) if fields else "(unspecified)"
 
 
+def state_to_dict(state: ThermoState | None) -> dict | None:
+    if state is None:
+        return None
+    return {
+        "pressure_mpa": state.pressure_mpa,
+        "temperature_c": state.temperature_c,
+        "enthalpy_kj_kg": state.enthalpy_kj_kg,
+        "entropy_kj_kgk": state.entropy_kj_kgk,
+        "specific_volume_m3_kg": state.specific_volume_m3_kg,
+        "dynamic_viscosity_pa_s": state.dynamic_viscosity_pa_s,
+        "quality": state.quality,
+    }
+
+
+def state_from_dict(data: dict | None) -> ThermoState | None:
+    if data is None:
+        return None
+    return ThermoState(
+        pressure_mpa=float(data.get("pressure_mpa", 0.0)),
+        temperature_c=float(data.get("temperature_c", 0.0)),
+        enthalpy_kj_kg=float(data.get("enthalpy_kj_kg", 0.0)),
+        entropy_kj_kgk=float(data.get("entropy_kj_kgk", 0.0)),
+        specific_volume_m3_kg=float(data.get("specific_volume_m3_kg", 0.0)),
+        dynamic_viscosity_pa_s=data.get("dynamic_viscosity_pa_s"),
+        quality=data.get("quality"),
+    )
+
+
 class SteamPropertyBackend:
     """Thin wrapper around IAPWS97 with unit conversions and friendly errors."""
 

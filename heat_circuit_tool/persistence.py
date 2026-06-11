@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
-from .thermo import ThermoState
+from .model_layout import ComponentLayout, ComponentUIState
+from .thermo import state_from_dict, state_to_dict, ThermoState
 
 
 def _spec_to_dict(spec: ThermoSpec) -> dict[str, Any]:
@@ -51,125 +52,116 @@ def _spec_from_dict(data: dict[str, Any]) -> ThermoSpec:
     )
 
 
-def _state_to_dict(state: ThermoState | None) -> dict[str, Any] | None:
-    if state is None:
-        return None
-    return {
-        "pressure_mpa": state.pressure_mpa,
-        "temperature_c": state.temperature_c,
-        "enthalpy_kj_kg": state.enthalpy_kj_kg,
-        "entropy_kj_kgk": state.entropy_kj_kgk,
-        "specific_volume_m3_kg": state.specific_volume_m3_kg,
-        "dynamic_viscosity_pa_s": state.dynamic_viscosity_pa_s,
-        "quality": state.quality,
-    }
-
-
-def _state_from_dict(data: dict[str, Any] | None) -> ThermoState | None:
-    if data is None:
-        return None
-    return ThermoState(
-        pressure_mpa=float(data.get("pressure_mpa", 0.0)),
-        temperature_c=float(data.get("temperature_c", 0.0)),
-        enthalpy_kj_kg=float(data.get("enthalpy_kj_kg", 0.0)),
-        entropy_kj_kgk=float(data.get("entropy_kj_kgk", 0.0)),
-        specific_volume_m3_kg=float(data.get("specific_volume_m3_kg", 0.0)),
-        dynamic_viscosity_pa_s=data.get("dynamic_viscosity_pa_s"),
-        quality=data.get("quality"),
-    )
-
-
 def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
+    """Serialize a Circuit, including layout and UI state, to a dict.
+
+    Layout fields (x, y, width, height) are read from ``circuit.layouts``.
+    UI state fields (unit_preferences, inlet/outlet_definition_mode,
+    solved_fields, conflicting_fields, is_dirty, report) are read from
+    ``circuit.ui_states``.
+    """
+    components_list = []
+    for component in circuit.components.values():
+        cid = component.component_id
+        layout = circuit.layouts.get(cid, ComponentLayout(component_id=cid))
+        ui = circuit.ui_states.get(cid, ComponentUIState(component_id=cid))
+
+        components_list.append({
+            "component_id": component.component_id,
+            "kind": component.kind.value,
+            "process_kind": component.process_kind.value,
+            "name": component.name,
+            "x": layout.x,
+            "y": layout.y,
+            "width": layout.width,
+            "height": layout.height,
+            "inlet_spec": _spec_to_dict(component.inlet_spec),
+            "outlet_spec": _spec_to_dict(component.outlet_spec),
+            "notes": component.notes,
+            "upstream_ids": list(component.upstream_ids),
+            "downstream_ids": list(component.downstream_ids),
+            "inlet_state": state_to_dict(component.inlet_state),
+            "outlet_state": state_to_dict(component.outlet_state),
+            "unit_preferences": dict(ui.unit_preferences),
+            "inlet_definition_mode": ui.inlet_definition_mode,
+            "outlet_definition_mode": ui.outlet_definition_mode,
+            "user_input_fields": sorted(component.user_input_fields),
+            "solved_fields": sorted(ui.solved_fields),
+            "conflicting_fields": sorted(ui.conflicting_fields),
+            "is_dirty": ui.is_dirty,
+            "report": ui.report,
+        })
+
     return {
         "start_component_id": circuit.start_component_id,
-        "seed_state": _state_to_dict(circuit.seed_state),
+        "seed_state": state_to_dict(circuit.seed_state),
         "seed_description": circuit.seed_description,
-        "components": [
-            {
-                "component_id": component.component_id,
-                "kind": component.kind.value,
-                "process_kind": component.process_kind.value,
-                "name": component.name,
-                "x": component.x,
-                "y": component.y,
-                "width": component.width,
-                "height": component.height,
-                "inlet_spec": _spec_to_dict(component.inlet_spec),
-                "outlet_spec": _spec_to_dict(component.outlet_spec),
-                "notes": component.notes,
-                "upstream_ids": list(component.upstream_ids),
-                "downstream_ids": list(component.downstream_ids),
-                "inlet_state": _state_to_dict(component.inlet_state),
-                "outlet_state": _state_to_dict(component.outlet_state),
-                "unit_preferences": dict(component.unit_preferences),
-                "inlet_definition_mode": component.inlet_definition_mode,
-                "outlet_definition_mode": component.outlet_definition_mode,
-                "user_input_fields": sorted(component.user_input_fields),
-                "solved_fields": sorted(component.solved_fields),
-                "conflicting_fields": sorted(component.conflicting_fields),
-                "is_dirty": component.is_dirty,
-                "report": component.report,
-            }
-            for component in circuit.components.values()
-        ],
+        "components": components_list,
     }
 
 
 def circuit_from_dict(data: dict[str, Any]) -> Circuit:
+    """Deserialize a Circuit from a dict, including layout and UI state."""
     circuit = Circuit(
         components={},
         start_component_id=data.get("start_component_id"),
-        seed_state=_state_from_dict(data.get("seed_state")),
+        seed_state=state_from_dict(data.get("seed_state")),
         seed_description=data.get("seed_description", ""),
     )
 
     for item in data.get("components", []):
+        cid = item["component_id"]
+
         component = Component(
-            component_id=item["component_id"],
+            component_id=cid,
             kind=ComponentKind(item["kind"]),
             process_kind=ProcessKind(item["process_kind"]),
-            name=item.get("name", item["component_id"]),
-            x=float(item.get("x", 0.0)),
-            y=float(item.get("y", 0.0)),
-            width=float(item.get("width", 180.0)),
-            height=float(item.get("height", 92.0)),
+            name=item.get("name", cid),
             inlet_spec=_spec_from_dict(item.get("inlet_spec", {})),
             outlet_spec=_spec_from_dict(item.get("outlet_spec", {})),
             notes=item.get("notes", ""),
             upstream_ids=list(item.get("upstream_ids", [])),
             downstream_ids=list(item.get("downstream_ids", [])),
-            inlet_state=_state_from_dict(item.get("inlet_state")),
-            outlet_state=_state_from_dict(item.get("outlet_state")),
+            inlet_state=state_from_dict(item.get("inlet_state")),
+            outlet_state=state_from_dict(item.get("outlet_state")),
+            user_input_fields=set(item.get("user_input_fields", [])),
+        )
+
+        layout = ComponentLayout(
+            component_id=cid,
+            x=float(item.get("x", 0.0)),
+            y=float(item.get("y", 0.0)),
+            width=float(item.get("width", 180.0)),
+            height=float(item.get("height", 92.0)),
+        )
+
+        ui_state = ComponentUIState(
+            component_id=cid,
             unit_preferences=dict(item.get("unit_preferences", {})),
             inlet_definition_mode=item.get("inlet_definition_mode", "Auto"),
             outlet_definition_mode=item.get("outlet_definition_mode", "Auto"),
-            user_input_fields=set(item.get("user_input_fields", [])),
             solved_fields=set(item.get("solved_fields", [])),
             conflicting_fields=set(item.get("conflicting_fields", [])),
-            is_dirty=bool(item.get("is_dirty", True)),
+            is_dirty=item.get("is_dirty", True),
             report=item.get("report", ""),
         )
-        circuit.components[component.component_id] = component
+
+        circuit.add_component(component, layout=layout, ui_state=ui_state)
+
     return circuit
 
 
-def save_project_file(
-    file_path: str,
-    circuit: Circuit,
-    snapshots: list[dict[str, Any]],
-    latest_solved: dict[str, Any] | None = None,
-) -> None:
+def save_project_file(path: str, circuit: Circuit,
+                      snapshots: list[dict[str, Any]] | None = None,
+                      latest_solved: dict[str, Any] | None = None) -> None:
     payload = {
-        "version": 1,
         "active_circuit": circuit_to_dict(circuit),
-        "snapshots": snapshots,
+        "snapshots": snapshots or [],
         "latest_solved": latest_solved,
     }
-    Path(file_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def load_project_file(file_path: str) -> dict[str, Any]:
-    payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
-    if "active_circuit" not in payload:
-        raise ValueError("Invalid project file: missing active_circuit")
-    return payload
+def load_project_file(path: str) -> dict[str, Any]:
+    text = Path(path).read_text(encoding="utf-8")
+    return json.loads(text)

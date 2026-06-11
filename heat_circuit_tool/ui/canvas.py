@@ -4,6 +4,8 @@ import tkinter as tk
 from typing import Callable, Optional
 
 from ..model import Circuit, Component, PortRole
+from ..model_layout import ComponentLayout, ComponentUIState
+from ._geometry import segment_intersects_rect
 from .path_finder import OrthogonalPathFinder, orthogonal_intersection_point
 
 
@@ -39,6 +41,18 @@ class NodeCanvas(tk.Canvas):
         self.bind("<ButtonRelease-2>", self._on_middle_release)
         self.bind("<MouseWheel>", self._on_mouse_wheel)
 
+    # ── Layout / UI state helpers ─────────────────────────────────────
+
+    def _layout(self, component: Component) -> ComponentLayout:
+        """Return the ComponentLayout for *component* from the circuit."""
+        return self.circuit.layout(component.component_id)
+
+    def _ui(self, component: Component) -> ComponentUIState:
+        """Return the ComponentUIState for *component* from the circuit."""
+        return self.circuit.ui_state(component.component_id)
+
+    # ── Public API ────────────────────────────────────────────────────
+
     def set_circuit(self, circuit: Circuit) -> None:
         self.circuit = circuit
         self.selected_component_id = None
@@ -57,27 +71,35 @@ class NodeCanvas(tk.Canvas):
         self._draw_connections()
         self._draw_components()
 
+    # ── Bounds and obstacle building ──────────────────────────────────
+
     def _build_component_bounds(self) -> None:
         self._component_bounds_world = {}
         self._text_obstacles_world = []
         for component in self.circuit.components.values():
+            lay = self._layout(component)
             self._component_bounds_world[component.component_id] = (
-                component.x,
-                component.y,
-                component.x + component.width,
-                component.y + component.height,
+                lay.x,
+                lay.y,
+                lay.x + lay.width,
+                lay.y + lay.height,
             )
-            if component.report:
-                cx = component.x + component.width / 2.0
-                text_top = component.y + component.height + 16.0
+            ui = self._ui(component)
+            if ui.report:
+                cx = lay.x + lay.width / 2.0
+                text_top = lay.y + lay.height + 16.0
                 text_bottom = text_top + 18.0
                 self._text_obstacles_world.append((cx - 190.0, text_top, cx + 190.0, text_bottom))
+
+    # ── Coordinate transform ──────────────────────────────────────────
 
     def _world_to_view(self, x: float, y: float) -> tuple[float, float]:
         return x * self.zoom + self.pan_x, y * self.zoom + self.pan_y
 
     def _view_to_world(self, x: float, y: float) -> tuple[float, float]:
         return (x - self.pan_x) / self.zoom, (y - self.pan_y) / self.zoom
+
+    # ── Grid ──────────────────────────────────────────────────────────
 
     def _draw_grid(self) -> None:
         width = max(self.winfo_width(), 800)
@@ -98,6 +120,8 @@ class NodeCanvas(tk.Canvas):
             _, y_view = self._world_to_view(0.0, float(y))
             self.create_line(0, y_view, width, y_view, fill="#18202b", width=1)
             y += int(spacing_world)
+
+    # ── Connection routing ────────────────────────────────────────────
 
     def _draw_connections(self) -> None:
         self._routed_segments_world = []
@@ -120,10 +144,7 @@ class NodeCanvas(tk.Canvas):
                 points = self._route_connection_points(
                     component.component_id,
                     downstream.component_id,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
+                    x1, y1, x2, y2,
                     self._routed_segments_world,
                 )
                 if len(points) < 2:
@@ -218,7 +239,7 @@ class NodeCanvas(tk.Canvas):
         peer = self.circuit.components.get(peer_id)
         if peer is None:
             return 0.0
-        px, py = peer.center()
+        px, py = self._layout(peer).center()
         return py if side in {"left", "right"} else px
 
     def _point_side_for_port(self, component_id: str, point: tuple[float, float]) -> str | None:
@@ -286,8 +307,8 @@ class NodeCanvas(tk.Canvas):
     def _preferred_sides(self, component_id: str, peer_id: str) -> list[str]:
         component = self.circuit.components[component_id]
         peer = self.circuit.components[peer_id]
-        cx, cy = component.center()
-        px, py = peer.center()
+        cx, cy = self._layout(component).center()
+        px, py = self._layout(peer).center()
         dx = px - cx
         dy = py - cy
 
@@ -303,7 +324,8 @@ class NodeCanvas(tk.Canvas):
     def _side_capacity(self, component: Component, side: str) -> int:
         corner_margin = 14.0
         min_gap = 18.0
-        side_len = component.height if side in {"left", "right"} else component.width
+        lay = self._layout(component)
+        side_len = lay.height if side in {"left", "right"} else lay.width
         usable = max(0.0, side_len - 2.0 * corner_margin)
         return max(1, int(usable // min_gap) + 1)
 
@@ -312,7 +334,7 @@ class NodeCanvas(tk.Canvas):
         points = self._evenly_spaced_points_on_side(component, side, len(peers))
 
         def projection(peer_id: str) -> float:
-            center = self.circuit.components[peer_id].center()
+            center = self._layout(self.circuit.components[peer_id]).center()
             return center[1] if side in {"left", "right"} else center[0]
 
         forward = sorted(peers, key=projection)
@@ -321,7 +343,7 @@ class NodeCanvas(tk.Canvas):
         def score(order: list[str]) -> float:
             total = 0.0
             for peer_id, point in zip(order, points):
-                px, py = self.circuit.components[peer_id].center()
+                px, py = self._layout(self.circuit.components[peer_id]).center()
                 total += abs(px - point[0]) + abs(py - point[1])
             return total
 
@@ -329,26 +351,27 @@ class NodeCanvas(tk.Canvas):
 
     def _evenly_spaced_points_on_side(self, component: Component, side: str, count: int) -> list[tuple[float, float]]:
         corner_margin = 14.0
+        lay = self._layout(component)
         if count <= 1:
             if side == "left":
-                return [(component.x, component.y + component.height / 2.0)]
+                return [(lay.x, lay.y + lay.height / 2.0)]
             if side == "right":
-                return [(component.x + component.width, component.y + component.height / 2.0)]
+                return [(lay.x + lay.width, lay.y + lay.height / 2.0)]
             if side == "top":
-                return [(component.x + component.width / 2.0, component.y)]
-            return [(component.x + component.width / 2.0, component.y + component.height)]
+                return [(lay.x + lay.width / 2.0, lay.y)]
+            return [(lay.x + lay.width / 2.0, lay.y + lay.height)]
 
         if side in {"left", "right"}:
-            start = component.y + corner_margin
-            end = component.y + component.height - corner_margin
+            start = lay.y + corner_margin
+            end = lay.y + lay.height - corner_margin
             step = (end - start) / (count - 1)
-            x = component.x if side == "left" else component.x + component.width
+            x = lay.x if side == "left" else lay.x + lay.width
             return [(x, start + idx * step) for idx in range(count)]
 
-        start = component.x + corner_margin
-        end = component.x + component.width - corner_margin
+        start = lay.x + corner_margin
+        end = lay.x + lay.width - corner_margin
         step = (end - start) / (count - 1)
-        y = component.y if side == "top" else component.y + component.height
+        y = lay.y if side == "top" else lay.y + lay.height
         return [(start + idx * step, y) for idx in range(count)]
 
     def _register_port_point(self, component_id: str, role: str, point: tuple[float, float]) -> None:
@@ -378,13 +401,14 @@ class NodeCanvas(tk.Canvas):
         component = self.circuit.components[component_id]
         corner_margin = 14.0
         min_gap = 18.0
+        lay = self._layout(component)
 
         if role == "outlet":
             peers = sorted(component.downstream_ids)
-            x = component.x + component.width
+            x = lay.x + lay.width
         else:
             peers = sorted(component.upstream_ids)
-            x = component.x
+            x = lay.x
 
         if peer_id not in peers:
             peers = peers + [peer_id]
@@ -392,9 +416,9 @@ class NodeCanvas(tk.Canvas):
 
         count = max(1, len(peers))
         idx = peers.index(peer_id)
-        y_top = component.y + corner_margin
-        y_bottom = component.y + component.height - corner_margin
-        center_y = component.y + component.height / 2.0
+        y_top = lay.y + corner_margin
+        y_bottom = lay.y + lay.height - corner_margin
+        center_y = lay.y + lay.height / 2.0
 
         if count == 1:
             preferred = center_y
@@ -435,10 +459,7 @@ class NodeCanvas(tk.Canvas):
         return path_finder.route_connection(
             source_id,
             target_id,
-            x1,
-            y1,
-            x2,
-            y2,
+            x1, y1, x2, y2,
             source_direction,
             target_direction,
             existing_segments,
@@ -473,31 +494,18 @@ class NodeCanvas(tk.Canvas):
         xv, yv = self._world_to_view(xw, yw)
         radius = max(5, int(7 * self.zoom))
         self.create_oval(
-            xv - radius,
-            yv - radius,
-            xv + radius,
-            yv + radius,
-            fill="#11161f",
-            outline="#11161f",
-            width=0,
+            xv - radius, yv - radius, xv + radius, yv + radius,
+            fill="#11161f", outline="#11161f", width=0,
             tags=("connection_bridge",),
         )
         if orientation == "horizontal":
-            start = 0
-            extent = 180
+            start, extent = 0, 180
         else:
-            start = 270
-            extent = 180
+            start, extent = 270, 180
         self.create_arc(
-            xv - radius,
-            yv - radius,
-            xv + radius,
-            yv + radius,
-            style=tk.ARC,
-            outline=color,
-            width=line_width,
-            start=start,
-            extent=extent,
+            xv - radius, yv - radius, xv + radius, yv + radius,
+            style=tk.ARC, outline=color, width=line_width,
+            start=start, extent=extent,
             tags=("connection_bridge",),
         )
 
@@ -529,55 +537,29 @@ class NodeCanvas(tk.Canvas):
             length += abs(x2 - x1) + abs(y2 - y1)
             for component_id, rect in self._component_bounds_world.items():
                 if self._segment_hits_component_with_endpoint_allowance(
-                    (x1, y1),
-                    (x2, y2),
-                    component_id,
-                    rect,
-                    10.0,
-                    source_id,
-                    target_id,
-                    index,
-                    total_segments,
+                    (x1, y1), (x2, y2),
+                    component_id, rect, 10.0,
+                    source_id, target_id,
+                    index, total_segments,
                 ):
                     penalty += 1000.0
             for rect in self._text_obstacles_world:
-                if self._segment_intersects_rect((x1, y1), (x2, y2), rect, pad=2.0):
+                if segment_intersects_rect((x1, y1), (x2, y2), rect, pad=2.0):
                     penalty += 1800.0
         return penalty + length * 0.001
 
-    def _segment_intersects_rect(
-        self,
-        p1: tuple[float, float],
-        p2: tuple[float, float],
-        rect: tuple[float, float, float, float],
-        pad: float = 0.0,
-    ) -> bool:
-        x1, y1 = p1
-        x2, y2 = p2
-        rx1, ry1, rx2, ry2 = rect
-        rx1 -= pad
-        ry1 -= pad
-        rx2 += pad
-        ry2 += pad
-        if abs(y1 - y2) < 1e-9:
-            y = y1
-            xmin, xmax = (x1, x2) if x1 <= x2 else (x2, x1)
-            return ry1 <= y <= ry2 and xmax >= rx1 and xmin <= rx2
-        if abs(x1 - x2) < 1e-9:
-            x = x1
-            ymin, ymax = (y1, y2) if y1 <= y2 else (y2, y1)
-            return rx1 <= x <= rx2 and ymax >= ry1 and ymin <= ry2
-        return False
+    # ── Component drawing ─────────────────────────────────────────────
 
     def _draw_components(self) -> None:
         for component in self.circuit.components.values():
             self._draw_component(component)
 
     def _draw_component(self, component: Component) -> None:
-        x1w = component.x
-        y1w = component.y
-        x2w = component.x + component.width
-        y2w = component.y + component.height
+        lay = self._layout(component)
+        x1w = lay.x
+        y1w = lay.y
+        x2w = lay.x + lay.width
+        y2w = lay.y + lay.height
 
         x1, y1 = self._world_to_view(x1w, y1w)
         x2, y2 = self._world_to_view(x2w, y2w)
@@ -586,60 +568,42 @@ class NodeCanvas(tk.Canvas):
         border_width = max(1, int(2 * self.zoom))
 
         self.create_rectangle(
-            x1,
-            y1,
-            x2,
-            y2,
-            fill=fill,
-            outline=outline,
-            width=border_width,
+            x1, y1, x2, y2,
+            fill=fill, outline=outline, width=border_width,
             tags=("component", f"component:{component.component_id}"),
         )
 
         self.create_text(
-            x1 + 12,
-            y1 + 14,
-            anchor="w",
-            text=component.name,
-            fill="#f6f7fb",
+            x1 + 12, y1 + 14, anchor="w",
+            text=component.name, fill="#f6f7fb",
             font=("Segoe UI", 12, "bold"),
             tags=("component_text", f"component:{component.component_id}"),
         )
         self.create_text(
-            x1 + 12,
-            y1 + 34,
-            anchor="w",
-            text=component.kind.value,
-            fill="#b7c4d8",
+            x1 + 12, y1 + 34, anchor="w",
+            text=component.kind.value, fill="#b7c4d8",
             font=("Segoe UI", 10),
             tags=("component_text", f"component:{component.component_id}"),
         )
         self.create_text(
-            x1 + 12,
-            y1 + 52,
-            anchor="w",
-            text=component.process_kind.value,
-            fill="#9fd8ff",
+            x1 + 12, y1 + 52, anchor="w",
+            text=component.process_kind.value, fill="#9fd8ff",
             font=("Segoe UI", 9, "italic"),
             tags=("component_text", f"component:{component.component_id}"),
         )
         if component.outlet_state is not None:
             self.create_text(
-                x1 + 12,
-                y1 + 72,
-                anchor="w",
+                x1 + 12, y1 + 72, anchor="w",
                 text=f"P={component.outlet_state.pressure_mpa:.3f} MPa  h={component.outlet_state.enthalpy_kj_kg:.1f}",
                 fill="#d8f1ff",
                 font=("Segoe UI", 8),
                 tags=("component_text", f"component:{component.component_id}"),
             )
-        if component.report:
+        ui = self._ui(component)
+        if ui.report:
             self.create_text(
-                (x1 + x2) / 2.0,
-                y2 + 22,
-                anchor="n",
-                text=component.report[:58],
-                fill="#d9dfef",
+                (x1 + x2) / 2.0, y2 + 22, anchor="n",
+                text=ui.report[:58], fill="#d9dfef",
                 font=("Segoe UI", 8),
                 tags=("component_text", f"component:{component.component_id}"),
             )
@@ -647,30 +611,22 @@ class NodeCanvas(tk.Canvas):
         inlet_points = self._used_port_points.get(component.component_id, {}).get("inlet", [])
         outlet_points = self._used_port_points.get(component.component_id, {}).get("outlet", [])
         if not inlet_points:
-            inlet_points = [component.inlet_port()]
+            inlet_points = [lay.inlet_port()]
         if not outlet_points:
-            outlet_points = [component.outlet_port()]
+            outlet_points = [lay.outlet_port()]
         r = max(5, int(7 * self.zoom))
         for inlet_xw, inlet_yw in inlet_points:
             inlet_x, inlet_y = self._world_to_view(inlet_xw, inlet_yw)
             self.create_oval(
-                inlet_x - r,
-                inlet_y - r,
-                inlet_x + r,
-                inlet_y + r,
-                fill="#ffcc66",
-                outline="",
+                inlet_x - r, inlet_y - r, inlet_x + r, inlet_y + r,
+                fill="#ffcc66", outline="",
                 tags=("port", f"port:{component.component_id}:{PortRole.INLET.value}"),
             )
         for outlet_xw, outlet_yw in outlet_points:
             outlet_x, outlet_y = self._world_to_view(outlet_xw, outlet_yw)
             self.create_oval(
-                outlet_x - r,
-                outlet_y - r,
-                outlet_x + r,
-                outlet_y + r,
-                fill="#67d4ff",
-                outline="",
+                outlet_x - r, outlet_y - r, outlet_x + r, outlet_y + r,
+                fill="#67d4ff", outline="",
                 tags=("port", f"port:{component.component_id}:{PortRole.OUTLET.value}"),
             )
         if self.pending_connection_source_id == component.component_id:
@@ -678,21 +634,17 @@ class NodeCanvas(tk.Canvas):
             outlet_x, outlet_y = self._world_to_view(outlet_xw, outlet_yw)
             highlight_r = r + max(3, int(4 * self.zoom))
             self.create_oval(
-                outlet_x - highlight_r,
-                outlet_y - highlight_r,
-                outlet_x + highlight_r,
-                outlet_y + highlight_r,
-                outline="#18f3a5",
-                width=max(2, int(2 * self.zoom)),
+                outlet_x - highlight_r, outlet_y - highlight_r,
+                outlet_x + highlight_r, outlet_y + highlight_r,
+                outline="#18f3a5", width=max(2, int(2 * self.zoom)),
             )
             self.create_text(
-                outlet_x + 12,
-                outlet_y - 14,
-                anchor="w",
-                text="source",
-                fill="#18f3a5",
+                outlet_x + 12, outlet_y - 14, anchor="w",
+                text="source", fill="#18f3a5",
                 font=("Segoe UI", 8, "bold"),
             )
+
+    # ── Hit testing ───────────────────────────────────────────────────
 
     def _component_at_world(self, event_x: float, event_y: float) -> Optional[str]:
         world_x, world_y = self._view_to_world(event_x, event_y)
@@ -711,6 +663,8 @@ class NodeCanvas(tk.Canvas):
                 _, component_id, port_role = tag.split(":")
                 return component_id, port_role
         return component_id, port_role
+
+    # ── Mouse events ──────────────────────────────────────────────────
 
     def _on_left_press(self, event: tk.Event) -> None:
         self.focus_set()
@@ -738,7 +692,8 @@ class NodeCanvas(tk.Canvas):
         self._drag_component_id = component_id
         component = self.circuit.components[component_id]
         world_x, world_y = self._view_to_world(event.x, event.y)
-        self._drag_offset_world = (world_x - component.x, world_y - component.y)
+        lay = self._layout(component)
+        self._drag_offset_world = (world_x - lay.x, world_y - lay.y)
 
     def _on_left_drag(self, event: tk.Event) -> None:
         if self._drag_component_id is None:
@@ -748,8 +703,9 @@ class NodeCanvas(tk.Canvas):
             return
         offset_x, offset_y = self._drag_offset_world
         world_x, world_y = self._view_to_world(event.x, event.y)
-        component.x = world_x - offset_x
-        component.y = world_y - offset_y
+        lay = self._layout(component)
+        lay.x = world_x - offset_x
+        lay.y = world_y - offset_y
         self._schedule_drag_redraw()
 
     def _on_left_release(self, event: tk.Event) -> None:

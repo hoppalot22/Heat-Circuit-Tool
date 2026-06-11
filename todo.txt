@@ -1,0 +1,122 @@
+# =============================================================================
+# Heat Circuit Tool — Refactor Plan (merged)
+# =============================================================================
+# Status:   [ ] todo   [~] in progress   [x] done   [!] blocked
+#
+# Dependency order: Phase 0 → Phase 1 → Phase 2 → Phase 3 ✅ →
+# Phase 4 → Phase 5 → Phase 6 → Phase 7 → Phase 8 ✅
+# =============================================================================
+
+
+# .............................................................................
+# PHASE 0 — Project Hygiene (quick wins)
+# .............................................................................
+[x] 0.1  Move shared helper _state_to_dict / _state_from_dict into thermo.py
+[x] 0.2  Deduplicate _segment_intersects_rect into ui/_geometry.py
+[ ] 0.3  Deduplicate ThermoSpec.pretty() and StateSpec.pretty()
+[x] 0.4  Add __all__ to model.py, solver.py, thermo.py, persistence.py
+[x] 0.5  tolerances.py created, solver.py uses centralised constants
+[x] 0.6  except Exception → except ValueError in solver.py
+
+
+# .............................................................................
+# PHASE 1 — Separate Engineering Model From UI State
+# .............................................................................
+# 1.1: ComponentLayout
+[x] 1.1a  Create ComponentLayout dataclass (model_layout.py)
+[x] 1.1b  Move x, y, width, height out of Component into ComponentLayout
+[x] 1.1c  Canvas renders using ComponentLayout
+[x] 1.1d  Save/load supports layout data
+# 1.2: ComponentUIState
+[x] 1.2a  Create ComponentUIState dataclass (model_layout.py)
+[x] 1.2b  Move is_dirty, report out of Component into ComponentUIState
+[x] 1.2c  Canvas/inspector reads from ComponentUIState
+# Note: 1.1b-d and 1.2b-c completed together in a single migration pass
+
+
+# .............................................................................
+# PHASE 2 — Introduce a Project Model
+# .............................................................................
+[ ] 2.1  Create Project dataclass (circuit, layouts, ui_state)
+[ ] 2.2  Replace self.circuit with self.project.circuit in main window
+
+
+# .............................................................................
+# PHASE 3 — Isolate Solver ✅
+# .............................................................................
+[x] 3.1  Create circuit_solution.py with immutable ComponentSolution / CircuitSolution
+[x] 3.2  Add SolverState class to solver.py (solver state not stored on Component)
+[x] 3.3  Refactor solve_circuit to use SolverState instead of mutating Component
+[x] 3.4  UI already copies results from solution back to components
+[x] 3.5  demo.py already uses solution API
+[x] 3.6  All 77 tests pass — solver no longer mutates Component objects
+
+
+# .............................................................................
+# PHASE 4 — Create Controllers
+# .............................................................................
+[ ] 4.1  Create ProjectController (new/open/save/save-as/dirty tracking)
+[ ] 4.2  Create SolveController (run solve, store solution, publish results)
+[ ] 4.3  Wire controllers into main window
+# Note: Main window should no longer do file I/O or direct solver calls
+
+
+# .............................................................................
+# PHASE 5 — Extract Connection Routing
+# .............................................................................
+[ ] 5.1  Create ConnectionRouter class
+[ ] 5.2  Move _assign_all_connection_ports, _route_connection_points,
+         _route_connection out of canvas
+[ ] 5.3  Canvas only renders results from router
+
+
+# .............................................................................
+# PHASE 6 — Clean Up Specifications
+# .............................................................................
+[ ] 6.1  Split ThermoSpec into:
+         - StateSpec (pressure, temperature, enthalpy, entropy, quality)
+         - EquipmentSpec (efficiency, dP, Q, geometry fields)
+
+
+# .............................................................................
+# PHASE 7 — Add Unit Service
+# .............................................................................
+[ ] 7.1  Create UnitManager (convert_pressure, format_pressure, etc.)
+[ ] 7.2  Remove formatting logic from ThermoState and Component
+
+
+# .............................................................................
+# PHASE 8 — Test Coverage ✅
+# .............................................................................
+[x] 8.1  pytest installed
+[x] 8.2  Circuit model tests — 37 tests
+[x] 8.3  Solver tests — 33 tests (demo + physics + diagnostics + errors)
+[x] 8.4  Persistence tests — 7 tests
+[x] 8.5  Total: 77 tests, all passing
+
+
+# .............................................................................
+# PHASE 9 — Future Architecture Target
+# .............................................................................
+# After all refactors the project should roughly look like:
+#   project/
+#   ├── model/
+#   │   ├── circuit.py
+#   │   ├── component.py
+#   │   ├── thermo.py
+#   │   ├── project.py
+#   ├── solver/
+#   │   ├── solver.py
+#   │   ├── solution.py
+#   ├── controllers/
+#   │   ├── project_controller.py
+#   │   ├── solve_controller.py
+#   ├── services/
+#   │   ├── steam_backend.py
+#   │   ├── unit_manager.py
+#   │   ├── connection_router.py
+#   ├── ui/
+#   │   ├── canvas.py
+#   │   ├── inspector.py
+#   │   ├── main_window.py
+#   └── tests/

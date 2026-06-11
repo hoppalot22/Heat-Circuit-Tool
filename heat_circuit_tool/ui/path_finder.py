@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import heapq
 
+from ._geometry import segment_intersects_rect
+
 
 def orthogonal_intersection_point(
     p1: tuple[float, float],
@@ -115,7 +117,7 @@ class OrthogonalPathFinder:
             p1 = points[i]
             p2 = points[i + 1]
             for rect in self._text_obstacles_world:
-                if self._segment_intersects_rect(p1, p2, rect, pad=2.0):
+                if segment_intersects_rect(p1, p2, rect, pad=2.0):
                     return True
         return False
 
@@ -132,7 +134,7 @@ class OrthogonalPathFinder:
                 p1 = route[index]
                 p2 = route[index + 1]
                 for rect in self._text_obstacles_world:
-                    if not self._segment_intersects_rect(p1, p2, rect, pad=2.0):
+                    if not segment_intersects_rect(p1, p2, rect, pad=2.0):
                         continue
                     rx1, ry1, rx2, ry2 = rect
                     lane_candidates: list[list[tuple[float, float]]] = []
@@ -362,7 +364,7 @@ class OrthogonalPathFinder:
         obstacles: list[tuple[float, float, float, float]],
     ) -> bool:
         for rect in obstacles:
-            if self._segment_intersects_rect(p1, p2, rect, pad=0.0):
+            if segment_intersects_rect(p1, p2, rect, pad=0.0):
                 return True
         return False
 
@@ -391,7 +393,7 @@ class OrthogonalPathFinder:
                 ):
                     return True
             for rect in self._text_obstacles_world:
-                if self._segment_intersects_rect(p1, p2, rect, pad=2.0):
+                if segment_intersects_rect(p1, p2, rect, pad=2.0):
                     return True
         return False
 
@@ -418,7 +420,7 @@ class OrthogonalPathFinder:
         segment_index: int,
         total_segments: int,
     ) -> bool:
-        if not self._segment_intersects_rect(p1, p2, rect, pad=pad):
+        if not segment_intersects_rect(p1, p2, rect, pad=pad):
             return False
         if component_id == source_id and segment_index == 0:
             return False
@@ -568,7 +570,7 @@ class OrthogonalPathFinder:
                 ):
                     penalty += 1000.0
             for rect in self._text_obstacles_world:
-                if self._segment_intersects_rect((x1, y1), (x2, y2), rect, pad=2.0):
+                if segment_intersects_rect((x1, y1), (x2, y2), rect, pad=2.0):
                     penalty += 1800.0
         for index in range(1, total_segments):
             prev = (points[index - 1], points[index])
@@ -577,30 +579,6 @@ class OrthogonalPathFinder:
                 bends += 1
         # Keep length as a tie-breaker only; prefer routes with fewer bends.
         return penalty + bends * 300.0 + length * 0.0001
-
-    def _segment_intersects_rect(
-        self,
-        p1: tuple[float, float],
-        p2: tuple[float, float],
-        rect: tuple[float, float, float, float],
-        pad: float = 0.0,
-    ) -> bool:
-        x1, y1 = p1
-        x2, y2 = p2
-        rx1, ry1, rx2, ry2 = rect
-        rx1 -= pad
-        ry1 -= pad
-        rx2 += pad
-        ry2 += pad
-        if abs(y1 - y2) < 1e-9:
-            y = y1
-            xmin, xmax = (x1, x2) if x1 <= x2 else (x2, x1)
-            return ry1 <= y <= ry2 and xmax >= rx1 and xmin <= rx2
-        if abs(x1 - x2) < 1e-9:
-            x = x1
-            ymin, ymax = (y1, y2) if y1 <= y2 else (y2, y1)
-            return rx1 <= x <= rx2 and ymax >= ry1 and ymin <= ry2
-        return False
 
     def _reduce_tiny_doglegs(
         self,

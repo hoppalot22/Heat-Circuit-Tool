@@ -7,7 +7,46 @@ from typing import Optional
 
 from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
 from .thermo import StateSpec, SteamPropertyBackend, ThermoState
+from .tolerances import (
+    BISECTION_CONVERGENCE,
+    BISECTION_MAX_ITERATIONS,
+    CLOSURE_ENTHALPY_TOL,
+    CLOSURE_PRESSURE_TOL,
+    ENTHALPY_TOL,
+    ENTROPY_TOL,
+    ISOCHORIC_CONVERGENCE,
+    ISOCHORIC_MAX_ITERATIONS,
+    PRESSURE_DROP_TOL,
+    PRESSURE_TOL,
+    QUALITY_TOL,
+    SPECIFIC_VOLUME_TOL,
+    STATE_CHANGE_TOL,
+    TEMPERATURE_TOL,
+)
 from .units import almost_equal
+
+
+class SolverState:
+    """Tracks solver state during iteration without mutating Component objects."""
+
+    def __init__(self) -> None:
+        self.inlet_states: dict[str, ThermoState] = {}
+        self.outlet_states: dict[str, ThermoState] = {}
+        self.reports: dict[str, str] = {}
+
+    def get_inlet(self, component_id: str) -> ThermoState | None:
+        return self.inlet_states.get(component_id)
+
+    def get_outlet(self, component_id: str) -> ThermoState | None:
+        return self.outlet_states.get(component_id)
+
+    def set_result(self, component_id: str, inlet: ThermoState | None,
+                   outlet: ThermoState | None, report: str) -> None:
+        if inlet is not None:
+            self.inlet_states[component_id] = inlet
+        if outlet is not None:
+            self.outlet_states[component_id] = outlet
+        self.reports[component_id] = report
 
 
 @dataclass(slots=True)
@@ -59,6 +98,7 @@ class CircuitSolution:
             lines.append(f"Loop closure h error: {self.closure_error_h_kj_kg:.4f} kJ/kg")
         if self.closure_error_p_mpa is not None:
             lines.append(f"Loop closure P error: {self.closure_error_p_mpa:.6f} MPa")
+        
         lines.append(f"Constraint status: {self.system_status}")
         if self.underconstrained_components:
             lines.append("Underconstrained components: " + ", ".join(self.underconstrained_components))
@@ -122,35 +162,44 @@ class ThermoSolver:
         self.backend = backend or SteamPropertyBackend()
 
     def solve_circuit(self, circuit: Circuit) -> CircuitSolution:
+        """Solve the circuit and return a CircuitSolution.
+
+        This method does NOT mutate Component objects.  All mutable solver
+        state (inlet/outlet states during iteration) is kept in a local
+        ``SolverState`` dictionary that is discarded when solving finishes.
+        """
         if circuit.start_component_id is None:
             raise SolverError("Circuit has no start component.")
         if circuit.seed_state is None:
             raise SolverError("Circuit needs a seed state before it can be solved.")
-
-        for component in circuit.components.values():
-            component.reset_results()
 
         solution = CircuitSolution()
         order = circuit.traversal_order(circuit.start_component_id)
         if not order:
             raise SolverError("Circuit has no components to solve.")
 
+        # Mutable solver state – never written to Component objects.
+        solver_state = SolverState()
+
         results_by_id: dict[str, ComponentResult] = {}
         for _ in range(20):
             changed = False
             for component in order:
-                inlet_state = self._resolve_inlet_state(circuit, component)
-                outlet_state_hint = self._resolve_outlet_state(circuit, component)
+                inlet_state = self._resolve_inlet_state(circuit, component, solver_state)
+                outlet_state_hint = self._resolve_outlet_state(circuit, component, solver_state)
                 if inlet_state is None and outlet_state_hint is None:
                     continue
-                previous_inlet = component.inlet_state
-                previous_outlet = component.outlet_state
+                previous_inlet = solver_state.get_inlet(component.component_id)
+                previous_outlet = solver_state.get_outlet(component.component_id)
                 result = self.solve_component(component, inlet_state, outlet_state_hint)
-                component.inlet_state = result.inlet_state
-                component.outlet_state = result.outlet_state
-                component.report = result.message
+                solver_state.set_result(
+                    component.component_id,
+                    result.inlet_state,
+                    result.outlet_state,
+                    result.message,
+                )
                 results_by_id[component.component_id] = result
-                if self._state_changed(previous_inlet, component.inlet_state) or self._state_changed(previous_outlet, component.outlet_state):
+                if self._state_changed(previous_inlet, solver_state.get_inlet(component.component_id)) or self._state_changed(previous_outlet, solver_state.get_outlet(component.component_id)):
                     changed = True
             if not changed:
                 break
@@ -163,29 +212,41 @@ class ThermoSolver:
                     component_name=component.name,
                     kind=component.kind,
                     process_kind=component.process_kind,
-                    inlet_state=component.inlet_state,
-                    outlet_state=component.outlet_state,
+                    inlet_state=solver_state.get_inlet(component.component_id),
+                    outlet_state=solver_state.get_outlet(component.component_id),
                     status="Undeterminable",
                     message="No solvable inlet state could be resolved from upstream links.",
                 )
-                component.report = result.message
             solution.component_results.append(result)
 
         self._accumulate_metrics(solution)
-        self._evaluate_closure(circuit, solution)
+        self._evaluate_closure(circuit, solution, solver_state)
         self._evaluate_constraints(solution)
         self._evaluate_connectivity(circuit, solution)
         return solution
 
-    def _resolve_inlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
+    def _resolve_inlet_state(self, circuit: Circuit, component: Component,
+                             solver_state: SolverState | None = None) -> ThermoState | None:
+        """Resolve the inlet state for *component*.
+
+        If *solver_state* is provided (iterative solve), upstream outlet
+        states are read from it instead of from ``Component.outlet_state``.
+        """
         user_inlet = self._state_from_thermo_spec(component.inlet_spec)
         if user_inlet is not None:
             return user_inlet
         upstream_states: list[ThermoState] = []
         for upstream_id in circuit.incoming(component.component_id):
             upstream = circuit.components.get(upstream_id)
-            if upstream and upstream.outlet_state is not None:
-                upstream_states.append(upstream.outlet_state)
+            if upstream is None:
+                continue
+            # Prefer solver_state (no mutation), fall back to Component (legacy).
+            if solver_state is not None:
+                state = solver_state.get_outlet(upstream_id)
+            else:
+                state = upstream.outlet_state
+            if state is not None:
+                upstream_states.append(state)
         if not upstream_states:
             if component.component_id == circuit.start_component_id and circuit.seed_state is not None:
                 return circuit.seed_state
@@ -194,15 +255,28 @@ class ThermoSolver:
             return upstream_states[0]
         return self._mix_states(upstream_states)
 
-    def _resolve_outlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
+    def _resolve_outlet_state(self, circuit: Circuit, component: Component,
+                              solver_state: SolverState | None = None) -> ThermoState | None:
+        """Resolve the outlet state hint for *component*.
+
+        If *solver_state* is provided (iterative solve), downstream inlet
+        states are read from it instead of from ``Component.inlet_state``.
+        """
         user_outlet = self._state_from_thermo_spec(component.outlet_spec)
         if user_outlet is not None:
             return user_outlet
         downstream_states: list[ThermoState] = []
         for downstream_id in circuit.outgoing(component.component_id):
             downstream = circuit.components.get(downstream_id)
-            if downstream and downstream.inlet_state is not None:
-                downstream_states.append(downstream.inlet_state)
+            if downstream is None:
+                continue
+            # Prefer solver_state (no mutation), fall back to Component (legacy).
+            if solver_state is not None:
+                state = solver_state.get_inlet(downstream_id)
+            else:
+                state = downstream.inlet_state
+            if state is not None:
+                downstream_states.append(state)
         if not downstream_states:
             return None
         if len(downstream_states) == 1:
@@ -229,7 +303,7 @@ class ThermoSolver:
             )
             try:
                 state = self.backend.make_state(candidate)
-            except Exception:
+            except ValueError:
                 continue
             if self._state_matches_optional_fields(state, full):
                 return state
@@ -239,12 +313,12 @@ class ThermoSolver:
 
     def _state_matches_optional_fields(self, state: ThermoState, spec: StateSpec) -> bool:
         checks: list[tuple[float | None, float | None, float]] = [
-            (spec.pressure_mpa, state.pressure_mpa, 1e-5),
-            (spec.temperature_c, state.temperature_c, 1e-3),
-            (spec.enthalpy_kj_kg, state.enthalpy_kj_kg, 1e-2),
-            (spec.entropy_kj_kgk, state.entropy_kj_kgk, 1e-4),
-            (spec.specific_volume_m3_kg, state.specific_volume_m3_kg, 1e-7),
-            (spec.quality, state.quality, 1e-4),
+            (spec.pressure_mpa, state.pressure_mpa, PRESSURE_TOL),
+            (spec.temperature_c, state.temperature_c, TEMPERATURE_TOL),
+            (spec.enthalpy_kj_kg, state.enthalpy_kj_kg, ENTHALPY_TOL),
+            (spec.entropy_kj_kgk, state.entropy_kj_kgk, ENTROPY_TOL),
+            (spec.specific_volume_m3_kg, state.specific_volume_m3_kg, SPECIFIC_VOLUME_TOL),
+            (spec.quality, state.quality, QUALITY_TOL),
         ]
         for expected, actual, tol in checks:
             if expected is None:
@@ -260,7 +334,7 @@ class ThermoSolver:
         mean_enthalpy = sum(state.enthalpy_kj_kg for state in states) / len(states)
         try:
             return self.backend.state_from_pressure_enthalpy(mean_pressure, mean_enthalpy)
-        except Exception:
+        except ValueError:
             return states[0]
 
     def _state_changed(self, previous: ThermoState | None, current: ThermoState | None) -> bool:
@@ -268,7 +342,7 @@ class ThermoSolver:
             return False
         if previous is None or current is None:
             return True
-        return not self.backend.same_state(previous, current, tolerance=1e-5)
+        return not self.backend.same_state(previous, current, tolerance=STATE_CHANGE_TOL)
 
     def _accumulate_metrics(self, solution: CircuitSolution) -> None:
         for result in solution.component_results:
@@ -284,30 +358,41 @@ class ThermoSolver:
         if solution.total_turbine_work_kj_kg > 1e-9:
             solution.back_work_ratio = solution.total_pump_work_kj_kg / solution.total_turbine_work_kj_kg
 
-    def _evaluate_closure(self, circuit: Circuit, solution: CircuitSolution) -> None:
+    def _evaluate_closure(self, circuit: Circuit, solution: CircuitSolution,
+                          solver_state: SolverState | None = None) -> None:
         if circuit.start_component_id is None:
             return
         returning_states: list[ThermoState] = []
         for upstream_id in circuit.incoming(circuit.start_component_id):
             upstream = circuit.components.get(upstream_id)
-            if upstream and upstream.outlet_state is not None:
-                returning_states.append(upstream.outlet_state)
+            if upstream is None:
+                continue
+            if solver_state is not None:
+                state = solver_state.get_outlet(upstream_id)
+            else:
+                state = upstream.outlet_state
+            if state is not None:
+                returning_states.append(state)
         if not returning_states:
             return
         loop_return = self._mix_states(returning_states)
         reference_state = None
-        start_component = circuit.components.get(circuit.start_component_id)
-        if start_component is not None and start_component.inlet_state is not None:
-            reference_state = start_component.inlet_state
-        elif circuit.seed_state is not None:
+        # Use the solved inlet state of the start component if available.
+        if solver_state is not None:
+            reference_state = solver_state.get_inlet(circuit.start_component_id)
+        if reference_state is None:
+            start_component = circuit.components.get(circuit.start_component_id)
+            if start_component is not None and start_component.inlet_state is not None:
+                reference_state = start_component.inlet_state
+        if reference_state is None:
             reference_state = circuit.seed_state
-        else:
+        if reference_state is None:
             return
         solution.closure_error_h_kj_kg = loop_return.enthalpy_kj_kg - reference_state.enthalpy_kj_kg
         solution.closure_error_p_mpa = loop_return.pressure_mpa - reference_state.pressure_mpa
-        if not almost_equal(loop_return.enthalpy_kj_kg, reference_state.enthalpy_kj_kg, tolerance=1e-3):
+        if not almost_equal(loop_return.enthalpy_kj_kg, reference_state.enthalpy_kj_kg, tolerance=CLOSURE_ENTHALPY_TOL):
             solution.messages.append("Loop closure enthalpy mismatch is non-zero.")
-        if not almost_equal(loop_return.pressure_mpa, reference_state.pressure_mpa, tolerance=1e-4):
+        if not almost_equal(loop_return.pressure_mpa, reference_state.pressure_mpa, tolerance=CLOSURE_PRESSURE_TOL):
             solution.messages.append("Loop closure pressure mismatch is non-zero.")
 
     def _evaluate_constraints(self, solution: CircuitSolution) -> None:
@@ -514,10 +599,10 @@ class ThermoSolver:
             if not found:
                 raise SolverError(f"{component.name} reverse solve could not bracket a valid inlet state.")
 
-        for _ in range(80):
+        for _ in range(BISECTION_MAX_ITERATIONS):
             mid = 0.5 * (lo + hi)
             f_mid = residual(mid)
-            if abs(f_mid) < 1e-6:
+            if abs(f_mid) < BISECTION_CONVERGENCE:
                 return self.backend.state_from_pressure_enthalpy(inlet_pressure, mid)
             if f_lo * f_mid <= 0.0:
                 hi = mid
@@ -536,14 +621,14 @@ class ThermoSolver:
         inlet_state: ThermoState,
         outlet_state: ThermoState,
     ) -> list[str]:
-        tolerances = {
-            "pressure_mpa": 1e-5,
-            "temperature_c": 1e-3,
-            "enthalpy_kj_kg": 1e-2,
-            "entropy_kj_kgk": 1e-4,
-            "specific_volume_m3_kg": 1e-7,
-            "quality": 1e-4,
-            "pressure_drop_mpa": 1e-5,
+        _tolerances = {
+            "pressure_mpa": PRESSURE_TOL,
+            "temperature_c": TEMPERATURE_TOL,
+            "enthalpy_kj_kg": ENTHALPY_TOL,
+            "entropy_kj_kgk": ENTROPY_TOL,
+            "specific_volume_m3_kg": SPECIFIC_VOLUME_TOL,
+            "quality": QUALITY_TOL,
+            "pressure_drop_mpa": PRESSURE_DROP_TOL,
         }
         mapping = {
             "pressure_mpa": "pressure_mpa",
@@ -561,7 +646,7 @@ class ThermoSolver:
                     continue
                 expected = getattr(component.inlet_spec, suffix)
                 actual = getattr(inlet_state, mapping[suffix])
-                if self._is_conflict(expected, actual, tolerances[suffix]):
+                if self._is_conflict(expected, actual, _tolerances[suffix]):
                     conflicts.append(field_name)
             elif field_name.startswith("outlet_"):
                 suffix = field_name.replace("outlet_", "", 1)
@@ -569,12 +654,12 @@ class ThermoSolver:
                     continue
                 expected = getattr(component.outlet_spec, suffix)
                 actual = getattr(outlet_state, mapping[suffix])
-                if self._is_conflict(expected, actual, tolerances[suffix]):
+                if self._is_conflict(expected, actual, _tolerances[suffix]):
                     conflicts.append(field_name)
             elif field_name == "pressure_drop_mpa":
                 expected = component.outlet_spec.pressure_drop_mpa
                 actual = max(0.0, inlet_state.pressure_mpa - outlet_state.pressure_mpa)
-                if self._is_conflict(expected, actual, tolerances["pressure_drop_mpa"]):
+                if self._is_conflict(expected, actual, _tolerances["pressure_drop_mpa"]):
                     conflicts.append(field_name)
         return conflicts
 
@@ -708,11 +793,11 @@ class ThermoSolver:
         if lower_error * upper_error > 0.0:
             raise SolverError(f"{component.name} cannot bracket an isochoric solution at {target_pressure:.4f} MPa.")
 
-        for _ in range(60):
+        for _ in range(ISOCHORIC_MAX_ITERATIONS):
             midpoint = 0.5 * (lower_c + upper_c)
             candidate = self.backend.state_from_pressure_temperature(target_pressure, midpoint)
             error = candidate.specific_volume_m3_kg - target_volume
-            if abs(error) < 1e-8:
+            if abs(error) < ISOCHORIC_CONVERGENCE:
                 return candidate
             if error * lower_error > 0.0:
                 lower_c = midpoint
@@ -764,9 +849,9 @@ class ThermoSolver:
         temp_is_user = "outlet_temperature_c" in component.user_input_fields
         h_is_user = "outlet_enthalpy_kj_kg" in component.user_input_fields
         if temp_is_user and h_is_user and component.outlet_spec.temperature_c is not None and component.outlet_spec.enthalpy_kj_kg is not None:
-            if not isclose(outlet_state.temperature_c, component.outlet_spec.temperature_c, abs_tol=1e-2):
+            if not isclose(outlet_state.temperature_c, component.outlet_spec.temperature_c, abs_tol=TEMPERATURE_TOL):
                 return "Overconstrained", f"{component.name} outlet temperature conflicts with other outlet targets."
-            if not isclose(outlet_state.enthalpy_kj_kg, component.outlet_spec.enthalpy_kj_kg, abs_tol=1e-2):
+            if not isclose(outlet_state.enthalpy_kj_kg, component.outlet_spec.enthalpy_kj_kg, abs_tol=ENTHALPY_TOL):
                 return "Overconstrained", f"{component.name} outlet enthalpy conflicts with other outlet targets."
         return "Solved", f"{component.name} solved successfully."
 

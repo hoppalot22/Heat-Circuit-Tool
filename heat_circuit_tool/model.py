@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .model_layout import ComponentLayout, ComponentUIState
 from .thermo import StateSpec, ThermoState
 
 
@@ -126,14 +127,17 @@ class ThermoSpec:
 
 @dataclass(slots=True)
 class Component:
+    """Engineering model for a circuit component.
+
+    Contains thermodynamic / process data plus the constraint-tracking
+    ``user_input_fields`` that the solver needs. Layout (x, y, width,
+    height) lives in ``ComponentLayout`` and transient UI state (is_dirty,
+    report, solved_fields, …) lives in ``ComponentUIState``.
+    """
     component_id: str
     kind: ComponentKind
     process_kind: ProcessKind
     name: str
-    x: float = 0.0
-    y: float = 0.0
-    width: float = 180.0
-    height: float = 92.0
     inlet_spec: ThermoSpec = field(default_factory=ThermoSpec)
     outlet_spec: ThermoSpec = field(default_factory=ThermoSpec)
     notes: str = ""
@@ -141,14 +145,7 @@ class Component:
     downstream_ids: list[str] = field(default_factory=list)
     inlet_state: Optional[ThermoState] = None
     outlet_state: Optional[ThermoState] = None
-    unit_preferences: dict[str, str] = field(default_factory=dict)
-    inlet_definition_mode: str = "Auto"
-    outlet_definition_mode: str = "Auto"
     user_input_fields: set[str] = field(default_factory=set)
-    solved_fields: set[str] = field(default_factory=set)
-    conflicting_fields: set[str] = field(default_factory=set)
-    is_dirty: bool = True
-    report: str = ""
 
     @property
     def upstream_id(self) -> Optional[str]:
@@ -166,21 +163,9 @@ class Component:
     def downstream_id(self, value: Optional[str]) -> None:
         self.downstream_ids = [value] if value else []
 
-    def center(self) -> tuple[float, float]:
-        return self.x + self.width / 2.0, self.y + self.height / 2.0
-
-    def inlet_port(self) -> tuple[float, float]:
-        return self.x, self.y + self.height / 2.0
-
-    def outlet_port(self) -> tuple[float, float]:
-        return self.x + self.width, self.y + self.height / 2.0
-
     def reset_results(self) -> None:
         self.inlet_state = None
         self.outlet_state = None
-        self.solved_fields.clear()
-        self.conflicting_fields.clear()
-        self.report = ""
 
     def label(self) -> str:
         return f"{self.name}\n{self.kind.value}"
@@ -189,19 +174,48 @@ class Component:
 @dataclass(slots=True)
 class Circuit:
     components: dict[str, Component] = field(default_factory=dict)
+    layouts: dict[str, ComponentLayout] = field(default_factory=dict)
+    ui_states: dict[str, ComponentUIState] = field(default_factory=dict)
     start_component_id: str | None = None
     seed_state: ThermoState | None = None
     seed_description: str = ""
 
-    def add_component(self, component: Component) -> None:
+    # ── Convenience accessors ──────────────────────────────────────────
+
+    def layout(self, component_id: str) -> ComponentLayout:
+        """Return the layout for *component_id*, creating one if needed."""
+        if component_id not in self.layouts:
+            self.layouts[component_id] = ComponentLayout(component_id=component_id)
+        return self.layouts[component_id]
+
+    def ui_state(self, component_id: str) -> ComponentUIState:
+        """Return the UI state for *component_id*, creating one if needed."""
+        if component_id not in self.ui_states:
+            self.ui_states[component_id] = ComponentUIState(component_id=component_id)
+        return self.ui_states[component_id]
+
+    def add_component(self, component: Component,
+                      layout: ComponentLayout | None = None,
+                      ui_state: ComponentUIState | None = None) -> None:
         self.components[component.component_id] = component
+        cid = component.component_id
+        if layout is not None:
+            self.layouts[cid] = layout
+        else:
+            self.layouts.setdefault(cid, ComponentLayout(component_id=cid))
+        if ui_state is not None:
+            self.ui_states[cid] = ui_state
+        else:
+            self.ui_states.setdefault(cid, ComponentUIState(component_id=cid))
         if self.start_component_id is None:
-            self.start_component_id = component.component_id
+            self.start_component_id = cid
 
     def remove_component(self, component_id: str) -> None:
         component = self.components.pop(component_id, None)
         if component is None:
             return
+        self.layouts.pop(component_id, None)
+        self.ui_states.pop(component_id, None)
         for other in self.components.values():
             other.upstream_ids = [item for item in other.upstream_ids if item != component_id]
             other.downstream_ids = [item for item in other.downstream_ids if item != component_id]

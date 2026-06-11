@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
+from .model_layout import ComponentLayout
 from .solver import SteamPropertyBackend, solve_circuit
 
 
@@ -12,8 +13,6 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.PUMP,
         process_kind=ProcessKind.ISENTROPIC,
         name="Feed Pump",
-        x=50,
-        y=250,
         inlet_spec=ThermoSpec(efficiency=0.85),
         outlet_spec=ThermoSpec(pressure_mpa=15.0, efficiency=0.85),
         notes="Pressurizes condensate to boiler pressure.",
@@ -23,8 +22,6 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.BOILER,
         process_kind=ProcessKind.ISOBARIC,
         name="Boiler",
-        x=320,
-        y=80,
         outlet_spec=ThermoSpec(pressure_mpa=15.0, temperature_c=540.0),
         notes="Superheats the feedwater to main steam conditions.",
     )
@@ -33,8 +30,6 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.TURBINE,
         process_kind=ProcessKind.ISENTROPIC,
         name="HP Turbine",
-        x=600,
-        y=80,
         outlet_spec=ThermoSpec(pressure_mpa=3.0, efficiency=0.88),
         notes="Expands steam to reheat pressure.",
     )
@@ -43,8 +38,6 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.REHEATER,
         process_kind=ProcessKind.ISOBARIC,
         name="Reheater",
-        x=880,
-        y=80,
         outlet_spec=ThermoSpec(pressure_mpa=3.0, temperature_c=540.0),
         notes="Restores steam temperature before the LP turbine.",
     )
@@ -53,8 +46,6 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.TURBINE,
         process_kind=ProcessKind.ISENTROPIC,
         name="LP Turbine",
-        x=1160,
-        y=80,
         outlet_spec=ThermoSpec(pressure_mpa=0.01, efficiency=0.88),
         notes="Expands steam to condenser pressure.",
     )
@@ -63,14 +54,21 @@ def build_reheat_rankine_demo() -> Circuit:
         kind=ComponentKind.CONDENSER,
         process_kind=ProcessKind.ISOBARIC,
         name="Condenser",
-        x=1440,
-        y=250,
         outlet_spec=ThermoSpec(pressure_mpa=0.01, quality=0.0),
         notes="Condenses exhaust steam to saturated liquid.",
     )
 
+    layouts = {
+        "P1": ComponentLayout(component_id="P1", x=50, y=250),
+        "B1": ComponentLayout(component_id="B1", x=320, y=80),
+        "T1": ComponentLayout(component_id="T1", x=600, y=80),
+        "R1": ComponentLayout(component_id="R1", x=880, y=80),
+        "T2": ComponentLayout(component_id="T2", x=1160, y=80),
+        "C1": ComponentLayout(component_id="C1", x=1440, y=250),
+    }
+
     for component in (pump, boiler, hpt, reheater, lpt, condenser):
-        circuit.add_component(component)
+        circuit.add_component(component, layout=layouts[component.component_id])
 
     circuit.connect("P1", "B1")
     circuit.connect("B1", "T1")
