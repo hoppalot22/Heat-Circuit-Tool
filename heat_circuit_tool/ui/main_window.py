@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import platform
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -11,7 +12,7 @@ from ..model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
 from ..persistence import circuit_from_dict, circuit_to_dict, load_project_file, save_project_file
 from ..presets import PRESETS, apply_preset, preset_names
 from ..solve_logging import append_solve_log
-from ..solver import ConstraintDiagnostics, CircuitSolution, SolverError, analyze_constraint_system, solve_circuit
+from ..solver import ConstraintDiagnostics, CircuitSolution, SolverError, ThermoSolver, analyze_constraint_system, solve_circuit
 from .canvas import NodeCanvas
 from .cycle_diagram import CycleDiagramPanel
 from .inspector import ComponentInspector
@@ -104,7 +105,9 @@ class HeatCircuitApp(ttk.Frame):
         style.configure("TLabelframe", background="#0f1319", foreground="#e9eef7")
         style.configure("TLabelframe.Label", background="#0f1319", foreground="#9fd8ff")
         style.configure("TButton", padding=6)
-        style.configure("PanelTool.TButton", padding=(2, 0), font=("Segoe UI Symbol", 9))
+        # Segoe UI Symbol is Windows-only; fall back to the default symbol font on macOS/Linux
+        _symbol_font = ("Segoe UI Symbol", 9) if platform.system() == "Windows" else ("TkDefaultFont", 9)
+        style.configure("PanelTool.TButton", padding=(2, 0), font=_symbol_font)
         style.configure("PanelBody.TFrame", background="#18202c")
 
     def _build_ui(self) -> None:
@@ -167,6 +170,8 @@ class HeatCircuitApp(ttk.Frame):
         self.canvas = NodeCanvas(self.canvas_frame, self.circuit, self.on_canvas_select)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Delete>", self.delete_selected_component)
+        # On macOS the physical Delete key sends BackSpace; bind both so it works on either platform.
+        self.canvas.bind("<BackSpace>", self.delete_selected_component)
 
         self.inspector_frame = tk.Frame(self.workspace, bg="#1a2230", highlightbackground="#344055", highlightthickness=1)
         self.inspector_frame.grid_propagate(False)
@@ -227,9 +232,10 @@ class HeatCircuitApp(ttk.Frame):
         self.results_text.insert("1.0", "Load the demo and press Solve to validate the reheat Rankine cycle.")
         self.results_text.configure(state="disabled")
 
-        self.inspector_resize_handle = tk.Label(self.inspector_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor="size_nw_se")
+        _resize_cursor = "size_nw_se" if platform.system() == "Windows" else "bottom_right_corner"
+        self.inspector_resize_handle = tk.Label(self.inspector_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor=_resize_cursor)
         self.inspector_resize_handle.place(relx=1.0, rely=1.0, anchor="se")
-        self.results_resize_handle = tk.Label(self.results_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor="size_nw_se")
+        self.results_resize_handle = tk.Label(self.results_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor=_resize_cursor)
         self.results_resize_handle.place(relx=1.0, rely=1.0, anchor="se")
 
         self.content_pane.add(self.canvas_frame, minsize=720)
@@ -328,6 +334,7 @@ class HeatCircuitApp(ttk.Frame):
         self.inspector.load_component(component_id)
         if self._popup_inspector:
             self._popup_inspector.load_component(component_id)
+        self._push_inspector_constraint_status(component_id)
         if component_id is None:
             self.status.set("No component selected")
         else:
@@ -508,13 +515,54 @@ class HeatCircuitApp(ttk.Frame):
             component.is_dirty = True
 
     def _on_inspector_apply(self) -> None:
+        self._solve_selected_component_preview()
         self.canvas.redraw()
         if self._popup_inspector and self._selection_id:
             self._popup_inspector.load_component(self._selection_id)
         self._update_live_diagnostics()
         if self._selection_id and self._selection_id in self.circuit.components:
             component = self.circuit.components[self._selection_id]
-            self.status.set(f"Updated {component.name}")
+            if component.is_dirty:
+                self.status.set(f"Updated {component.name}")
+            else:
+                self.status.set(f"Updated {component.name} and solved selected component")
+
+    def _solve_selected_component_preview(self) -> None:
+        if self._selection_id is None:
+            return
+        component = self.circuit.components.get(self._selection_id)
+        if component is None:
+            return
+
+        solver = ThermoSolver()
+        inlet_state = solver._resolve_inlet_state(self.circuit, component)
+        outlet_hint = solver._resolve_outlet_state(self.circuit, component)
+        if inlet_state is None and outlet_hint is None:
+            return
+
+        try:
+            result = solver.solve_component(component, inlet_state, outlet_hint)
+        except SolverError:
+            return
+        except Exception:
+            return
+
+        component.inlet_state = result.inlet_state
+        component.outlet_state = result.outlet_state
+        component.report = result.message
+        self.inspector.apply_solution_to_component(
+            result.component_id,
+            result.inlet_state,
+            result.outlet_state,
+            conflicting_fields=result.conflicting_fields,
+        )
+        if self._popup_inspector is not None:
+            self._popup_inspector.apply_solution_to_component(
+                result.component_id,
+                result.inlet_state,
+                result.outlet_state,
+                conflicting_fields=result.conflicting_fields,
+            )
 
     def _on_inspector_dirty(self) -> None:
         self.status.set("Model modified: solve required")
@@ -678,6 +726,28 @@ class HeatCircuitApp(ttk.Frame):
         else:
             self.constraint_badge_label.configure(bg="#b37a1f", fg="#ffffff")
 
+        # Push per-component status into canvas for coloured outlines
+        status_map = {
+            diag.component_id: diag.status
+            for diag in self._constraint_diagnostics.component_diagnostics
+        }
+        self.canvas.set_constraint_statuses(status_map)
+        self.canvas.redraw()
+
+        # Update inspector banner for the currently selected component
+        self._push_inspector_constraint_status(self._selection_id)
+
+    def _push_inspector_constraint_status(self, component_id: Optional[str]) -> None:
+        diag = None
+        if component_id is not None:
+            for d in self._constraint_diagnostics.component_diagnostics:
+                if d.component_id == component_id:
+                    diag = d
+                    break
+        self.inspector.update_constraint_status(diag)
+        if self._popup_inspector is not None:
+            self._popup_inspector.update_constraint_status(diag)
+
     def _pane_contains(self, pane: tk.PanedWindow, widget: tk.Widget) -> bool:
         widget_name = str(widget)
         return any(str(pane_item) == widget_name for pane_item in pane.panes())
@@ -688,11 +758,18 @@ class HeatCircuitApp(ttk.Frame):
             self._bind_recursive(child, sequence, callback)
 
     def _bind_panel_scroll_events(self) -> None:
+        self.canvas.bind("<Enter>", lambda _e: self._set_wheel_target("canvas"), add="+")
+        self.canvas.bind("<Leave>", lambda _e: self._clear_wheel_target("canvas"), add="+")
         self._bind_recursive(self.inspector_frame, "<Enter>", lambda _e: self._set_wheel_target("inspector"))
         self._bind_recursive(self.inspector_frame, "<Leave>", lambda _e: self._clear_wheel_target("inspector"))
         self._bind_recursive(self.results_frame, "<Enter>", lambda _e: self._set_wheel_target("results"))
         self._bind_recursive(self.results_frame, "<Leave>", lambda _e: self._clear_wheel_target("results"))
         self.bind_all("<MouseWheel>", self._on_global_mouse_wheel, add="+")
+        self.bind_all("<Shift-MouseWheel>", self._on_global_mouse_wheel, add="+")
+        self.bind_all("<Control-MouseWheel>", self._on_global_mouse_wheel, add="+")
+        self.bind_all("<Command-MouseWheel>", self._on_global_mouse_wheel, add="+")
+        self.bind_all("<Button-4>", self._on_global_scroll_up, add="+")
+        self.bind_all("<Button-5>", self._on_global_scroll_down, add="+")
 
     def _set_wheel_target(self, target: str) -> None:
         self._active_wheel_target = target
@@ -701,15 +778,99 @@ class HeatCircuitApp(ttk.Frame):
         if self._active_wheel_target == target:
             self._active_wheel_target = None
 
+    def _pointer_over_widget(self, widget: tk.Widget) -> bool:
+        try:
+            pointer_x, pointer_y = self.winfo_pointerxy()
+        except tk.TclError:
+            return False
+        left = widget.winfo_rootx()
+        top = widget.winfo_rooty()
+        right = left + widget.winfo_width()
+        bottom = top + widget.winfo_height()
+        return left <= pointer_x <= right and top <= pointer_y <= bottom
+
+    def _widget_under_pointer(self) -> tk.Widget | None:
+        try:
+            pointer_x, pointer_y = self.winfo_pointerxy()
+        except tk.TclError:
+            return None
+        return self.winfo_containing(pointer_x, pointer_y)
+
+    def _is_descendant_of(self, widget: tk.Widget | None, ancestor: tk.Widget) -> bool:
+        if widget is None:
+            return False
+        ancestor_name = str(ancestor)
+        widget_name = str(widget)
+        return widget_name == ancestor_name or widget_name.startswith(f"{ancestor_name}.")
+
     def _on_global_mouse_wheel(self, event: tk.Event) -> None:
-        if self._active_wheel_target == "inspector":
-            delta_steps = int(-event.delta / 120) if event.delta else 0
-            if delta_steps != 0:
-                self.inspector_scroll_canvas.yview_scroll(delta_steps, "units")
-        elif self._active_wheel_target == "results":
-            delta_steps = int(-event.delta / 120) if event.delta else 0
-            if delta_steps != 0:
-                self.results_text.yview_scroll(delta_steps, "units")
+        hovered = self._widget_under_pointer()
+        over_canvas = self._is_descendant_of(hovered, self.canvas)
+        over_inspector = self._is_descendant_of(hovered, self.inspector_frame)
+        over_results = self._is_descendant_of(hovered, self.results_frame)
+
+        # If pointer is not over inspector/results, default wheel handling to canvas.
+        if not over_inspector and not over_results:
+            over_canvas = True
+
+        if over_canvas:
+            raw = getattr(event, "delta", 0)
+            state = getattr(event, "state", 0)
+            self.canvas._set_input_debug(f"app wheel raw={raw} state={state}")
+            state = getattr(event, "state", 0)
+            if state & 0x0001:
+                self.canvas._on_canvas_shift_mouse_wheel(event)
+            elif state & 0x0004 or state & 0x0008:
+                self.canvas._on_canvas_modified_mouse_wheel(event)
+            else:
+                self.canvas._on_canvas_mouse_wheel(event)
+            return
+
+        # Windows delivers delta in multiples of 120; macOS delivers small pixel values.
+        # Normalise to ±1 steps regardless of platform.
+        raw = event.delta
+        if raw == 0:
+            return
+        if platform.system() == "Windows":
+            delta_steps = int(-raw / 120)
+        else:
+            delta_steps = -1 if raw > 0 else 1
+        if over_inspector:
+            self.inspector_scroll_canvas.yview_scroll(delta_steps, "units")
+        elif over_results:
+            self.results_text.yview_scroll(delta_steps, "units")
+
+    def _on_global_scroll_up(self, event: tk.Event) -> None:
+        hovered = self._widget_under_pointer()
+        over_canvas = self._is_descendant_of(hovered, self.canvas)
+        over_inspector = self._is_descendant_of(hovered, self.inspector_frame)
+        over_results = self._is_descendant_of(hovered, self.results_frame)
+        if not over_inspector and not over_results:
+            over_canvas = True
+        if over_canvas:
+            self.canvas._set_input_debug("app button-4")
+            self.canvas._on_canvas_scroll_up(event)
+            return
+        if over_inspector:
+            self.inspector_scroll_canvas.yview_scroll(-1, "units")
+        elif over_results:
+            self.results_text.yview_scroll(-1, "units")
+
+    def _on_global_scroll_down(self, event: tk.Event) -> None:
+        hovered = self._widget_under_pointer()
+        over_canvas = self._is_descendant_of(hovered, self.canvas)
+        over_inspector = self._is_descendant_of(hovered, self.inspector_frame)
+        over_results = self._is_descendant_of(hovered, self.results_frame)
+        if not over_inspector and not over_results:
+            over_canvas = True
+        if over_canvas:
+            self.canvas._set_input_debug("app button-5")
+            self.canvas._on_canvas_scroll_down(event)
+            return
+        if over_inspector:
+            self.inspector_scroll_canvas.yview_scroll(1, "units")
+        elif over_results:
+            self.results_text.yview_scroll(1, "units")
 
     def _bind_drag(self, key: str, header: tk.Widget, title: tk.Widget) -> None:
         for widget in (header, title):

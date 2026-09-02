@@ -5,7 +5,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from ..model import Circuit, ComponentKind, ProcessKind, ThermoSpec
-from ..solver import CircuitSolution
+from ..solver import CircuitSolution, ComponentConstraintDiagnostic
 from ..unit_system import best_prefixed_display, default_unit, from_internal, is_numeric_field, to_internal, unit_names
 
 
@@ -108,6 +108,13 @@ class ComponentInspector(ttk.Frame):
     _solver_bg = "#d7e7f5"
     _input_bg = "#eadfb9"
     _conflict_bg = "#f0b4b4"
+    _link_bg = "#d8ecd9"
+    _status_colors: dict[str, tuple[str, str]] = {
+        "Well-defined": ("#1a6e38", "#d4f5e0"),
+        "Overconstrained": ("#7a1f1f", "#f5d4d4"),
+        "Underconstrained": ("#6b4800", "#f5e8c8"),
+        "Blocked": ("#6b4800", "#f5e8c8"),
+    }
 
     def __init__(
         self,
@@ -131,6 +138,8 @@ class ComponentInspector(ttk.Frame):
         self._unit_vars: dict[str, tk.StringVar] = {}
         self._unit_widgets: dict[str, ttk.Combobox] = {}
         self._unit_last: dict[str, str] = {}
+        self._propagated_fields: set[str] = set()
+        self._linked_user_fields: set[str] = set()
         self._active_fields: set[str] = set(self._base_fields)
         self._kind_values = [kind.value for kind in ComponentKind]
         self._process_values = [process.value for process in ProcessKind]
@@ -140,7 +149,23 @@ class ComponentInspector(ttk.Frame):
         self._build()
 
     def _build(self) -> None:
-        for row, (field_name, label) in enumerate(self.field_specs):
+        # Constraint status banner (row 0, spans all columns)
+        self._constraint_status_frame = tk.Frame(self, bg="#2a3040", pady=3)
+        self._constraint_status_frame.grid(row=0, column=0, columnspan=3, sticky="ew", padx=0, pady=(0, 4))
+        self._constraint_status_label = tk.Label(
+            self._constraint_status_frame,
+            text="",
+            anchor="w",
+            bg="#2a3040",
+            fg="#9fb8d8",
+            font=("Segoe UI", 9),
+            wraplength=320,
+            justify="left",
+            padx=6,
+        )
+        self._constraint_status_label.pack(fill="x")
+
+        for row, (field_name, label) in enumerate(self.field_specs, start=1):
             label_widget = ttk.Label(self, text=label)
             label_widget.grid(row=row, column=0, sticky="w", padx=4, pady=2)
             self._labels[field_name] = label_widget
@@ -160,12 +185,12 @@ class ComponentInspector(ttk.Frame):
                 widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name == "notes":
-                widget = tk.Entry(self, textvariable=var, width=30, bg=self._neutral_bg)
+                widget = tk.Entry(self, textvariable=var, width=30, bg=self._neutral_bg, fg="#000000")
                 widget.bind("<KeyRelease>", lambda _e, f=field_name: self._on_any_field_modified(f))
                 self._colorable_fields.add(field_name)
                 unit_widget = self._make_unit_placeholder(row)
             else:
-                widget = tk.Entry(self, textvariable=var, width=20, bg=self._neutral_bg)
+                widget = tk.Entry(self, textvariable=var, width=20, bg=self._neutral_bg, fg="#000000")
                 widget.bind("<KeyRelease>", lambda _e, f=field_name: self._on_any_field_modified(f))
                 self._colorable_fields.add(field_name)
                 unit_widget = self._make_unit_selector(row, field_name)
@@ -176,9 +201,27 @@ class ComponentInspector(ttk.Frame):
 
         self.columnconfigure(1, weight=1)
 
-        button_row = len(self.field_specs)
+        button_row = len(self.field_specs) + 1  # +1 for the banner row
         ttk.Button(self, text="Apply to Component", command=self.apply_to_component).grid(row=button_row, column=0, columnspan=3, sticky="ew", padx=4, pady=(10, 2))
         ttk.Button(self, text="Solve Circuit", command=self.solve_requested).grid(row=button_row + 1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+
+    def update_constraint_status(self, diagnostic: ComponentConstraintDiagnostic | None) -> None:
+        if diagnostic is None:
+            self._constraint_status_label.configure(text="", bg="#2a3040", fg="#9fb8d8")
+            self._constraint_status_frame.configure(bg="#2a3040")
+            return
+        fg, bg = self._status_colors.get(diagnostic.status, ("#9fb8d8", "#2a3040"))
+        if diagnostic.missing_fields:
+            detail = f"Missing: {', '.join(diagnostic.missing_fields)}"
+        elif diagnostic.message:
+            detail = diagnostic.message
+        else:
+            detail = ""
+        text = f"{diagnostic.status}"
+        if detail:
+            text = f"{text}  \u2014  {detail}"
+        self._constraint_status_label.configure(text=text, bg=bg, fg=fg)
+        self._constraint_status_frame.configure(bg=bg)
 
     def _definition_fields_for_mode(self, prefix: str, mode: str) -> set[str]:
         suffixes = self._definition_mode_map.get(mode, self._definition_mode_map["Auto"])
@@ -260,6 +303,8 @@ class ComponentInspector(ttk.Frame):
         self.current_component_id = component_id
         self._loading = True
         if component_id is None:
+            self._propagated_fields.clear()
+            self._linked_user_fields.clear()
             for key, var in self._vars.items():
                 var.set("")
                 if key in self._colorable_fields:
@@ -327,8 +372,68 @@ class ComponentInspector(ttk.Frame):
             else:
                 self._vars[field_name].set("" if value is None else str(value))
 
+        self._apply_propagated_inlet_fields(component)
         self._apply_highlights(component)
         self._loading = False
+
+    def _apply_propagated_inlet_fields(self, component) -> None:
+        self._propagated_fields.clear()
+        self._linked_user_fields.clear()
+        self._propagate_from_neighbor(
+            component,
+            neighbor_ids=self.circuit.incoming(component.component_id),
+            own_fields=self._inlet_state_fields,
+            own_prefix="inlet_",
+            neighbor_spec_attr="outlet_spec",
+            neighbor_state_attr="outlet_state",
+            neighbor_field_prefix="outlet_",
+        )
+        self._propagate_from_neighbor(
+            component,
+            neighbor_ids=self.circuit.outgoing(component.component_id),
+            own_fields=self._outlet_state_fields,
+            own_prefix="outlet_",
+            neighbor_spec_attr="inlet_spec",
+            neighbor_state_attr="inlet_state",
+            neighbor_field_prefix="inlet_",
+        )
+
+    def _propagate_from_neighbor(
+        self,
+        component,
+        neighbor_ids: list[str],
+        own_fields: set[str],
+        own_prefix: str,
+        neighbor_spec_attr: str,
+        neighbor_state_attr: str,
+        neighbor_field_prefix: str,
+    ) -> None:
+        if len(neighbor_ids) != 1:
+            return
+        neighbor = self.circuit.components.get(neighbor_ids[0])
+        if neighbor is None:
+            return
+        neighbor_state = getattr(neighbor, neighbor_state_attr)
+        neighbor_spec = getattr(neighbor, neighbor_spec_attr)
+        for field_name in own_fields:
+            if field_name not in self._active_fields:
+                continue
+            if field_name in component.user_input_fields:
+                continue
+            if self._vars[field_name].get().strip():
+                continue
+            suffix = field_name[len(own_prefix):]
+            value = getattr(neighbor_state, suffix, None) if neighbor_state is not None else None
+            if value is None:
+                value = getattr(neighbor_spec, suffix, None)
+            if value is None:
+                continue
+            if f"{neighbor_field_prefix}{suffix}" in neighbor.user_input_fields:
+                self._linked_user_fields.add(field_name)
+            unit = component.unit_preferences.get(field_name, default_unit(field_name))
+            converted = from_internal(field_name, value, unit)
+            self._vars[field_name].set(self._format(converted))
+            self._propagated_fields.add(field_name)
 
     def apply_to_component(self) -> None:
         if self.current_component_id is None:
@@ -568,12 +673,14 @@ class ComponentInspector(ttk.Frame):
                 component.user_input_fields.add(field_name)
             else:
                 component.user_input_fields.discard(field_name)
+            self._propagated_fields.discard(field_name)
         self._clear_highlights_dirty(component)
 
     def _clear_highlights_dirty(self, component) -> None:
         component.solved_fields.clear()
         component.conflicting_fields.clear()
         component.is_dirty = True
+        self._apply_propagated_inlet_fields(component)
         self._apply_highlights(component)
         if self.on_dirty:
             self.on_dirty()
@@ -585,6 +692,8 @@ class ComponentInspector(ttk.Frame):
             if field_name not in self._active_fields:
                 continue
             color = self._neutral_bg
+            if field_name in self._propagated_fields:
+                color = self._link_bg
             if field_name in component.user_input_fields:
                 color = self._input_bg
             if not component.is_dirty and field_name in component.solved_fields:
@@ -616,6 +725,8 @@ class ComponentInspector(ttk.Frame):
             for field_name in required:
                 if field_name not in self._active_fields:
                     continue
+                if field_name not in component.user_input_fields and field_name not in self._linked_user_fields:
+                    return False
                 if not self._vars[field_name].get().strip():
                     return False
             return True

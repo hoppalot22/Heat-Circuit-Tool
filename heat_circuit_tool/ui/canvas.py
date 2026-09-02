@@ -22,6 +22,9 @@ class NodeCanvas(tk.Canvas):
         self._used_port_points: dict[str, dict[str, list[tuple[float, float]]]] = {}
         self._port_point_lookup: dict[tuple[str, str, str], tuple[float, float]] = {}
         self._drag_redraw_after_id: str | None = None
+        self._constraint_status_map: dict[str, str] = {}
+        self._input_debug_enabled = True
+        self._input_debug_text = "wheel: waiting"
 
         self.zoom = 1.0
         self.pan_x = 40.0
@@ -32,17 +35,33 @@ class NodeCanvas(tk.Canvas):
         self.bind("<ButtonPress-1>", self._on_left_press)
         self.bind("<B1-Motion>", self._on_left_drag)
         self.bind("<ButtonRelease-1>", self._on_left_release)
+        self.bind("<Enter>", self._on_enter)
         self.bind("<Double-Button-1>", self._on_double_click)
         self.bind("<Button-3>", self._on_right_click)
         self.bind("<ButtonPress-2>", self._on_middle_press)
         self.bind("<B2-Motion>", self._on_middle_drag)
         self.bind("<ButtonRelease-2>", self._on_middle_release)
-        self.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.bind("<MouseWheel>", self._on_canvas_mouse_wheel)
+        self.bind("<Shift-MouseWheel>", self._on_canvas_shift_mouse_wheel)
+        self.bind("<Control-MouseWheel>", self._on_canvas_modified_mouse_wheel)
+        self.bind("<Command-MouseWheel>", self._on_canvas_modified_mouse_wheel)
+        self.bind("<Button-4>", self._on_canvas_scroll_up)
+        self.bind("<Button-5>", self._on_canvas_scroll_down)
+        self.bind_all("<MouseWheel>", self._on_global_mouse_wheel, add="+")
+        self.bind_all("<Shift-MouseWheel>", self._on_global_shift_mouse_wheel, add="+")
+        self.bind_all("<Control-MouseWheel>", self._on_global_modified_mouse_wheel, add="+")
+        self.bind_all("<Command-MouseWheel>", self._on_global_modified_mouse_wheel, add="+")
+        self.bind_all("<Button-4>", self._on_global_scroll_up, add="+")
+        self.bind_all("<Button-5>", self._on_global_scroll_down, add="+")
+
+    def set_constraint_statuses(self, status_map: dict[str, str]) -> None:
+        self._constraint_status_map = status_map
 
     def set_circuit(self, circuit: Circuit) -> None:
         self.circuit = circuit
         self.selected_component_id = None
         self.pending_connection_source_id = None
+        self._constraint_status_map = {}
         self.redraw()
 
     def select_component(self, component_id: Optional[str]) -> None:
@@ -56,6 +75,20 @@ class NodeCanvas(tk.Canvas):
         self._draw_grid()
         self._draw_connections()
         self._draw_components()
+        self._draw_input_debug_overlay()
+
+    def _draw_input_debug_overlay(self) -> None:
+        if not self._input_debug_enabled:
+            return
+        self.create_text(
+            12,
+            10,
+            anchor="nw",
+            text=self._input_debug_text,
+            fill="#8ea6c4",
+            font=("Segoe UI", 8),
+            tags=("input_debug",),
+        )
 
     def _build_component_bounds(self) -> None:
         self._component_bounds_world = {}
@@ -582,7 +615,18 @@ class NodeCanvas(tk.Canvas):
         x1, y1 = self._world_to_view(x1w, y1w)
         x2, y2 = self._world_to_view(x2w, y2w)
         fill = "#28354a"
-        outline = "#67d4ff" if component.component_id == self.selected_component_id else "#7d8797"
+        if component.component_id == self.selected_component_id:
+            outline = "#67d4ff"
+        else:
+            _status = self._constraint_status_map.get(component.component_id, "Unknown")
+            if _status == "Well-defined":
+                outline = "#2a9955"
+            elif _status == "Overconstrained":
+                outline = "#c94040"
+            elif _status in {"Underconstrained", "Blocked"}:
+                outline = "#c4840a"
+            else:
+                outline = "#7d8797"
         border_width = max(1, int(2 * self.zoom))
 
         self.create_rectangle(
@@ -733,6 +777,8 @@ class NodeCanvas(tk.Canvas):
         if component_id is None:
             self.select_component(None)
             self.pending_connection_source_id = None
+            self._is_panning = True
+            self._pan_anchor = (event.x, event.y)
             return
         self.select_component(component_id)
         self._drag_component_id = component_id
@@ -742,6 +788,8 @@ class NodeCanvas(tk.Canvas):
 
     def _on_left_drag(self, event: tk.Event) -> None:
         if self._drag_component_id is None:
+            if self._is_panning:
+                self._on_middle_drag(event)
             return
         component = self.circuit.components.get(self._drag_component_id)
         if component is None:
@@ -753,6 +801,9 @@ class NodeCanvas(tk.Canvas):
         self._schedule_drag_redraw()
 
     def _on_left_release(self, event: tk.Event) -> None:
+        if self._is_panning and self._drag_component_id is None:
+            self._is_panning = False
+            return
         if self._drag_redraw_after_id is not None:
             self.after_cancel(self._drag_redraw_after_id)
             self._drag_redraw_after_id = None
@@ -795,13 +846,123 @@ class NodeCanvas(tk.Canvas):
     def _on_middle_release(self, event: tk.Event) -> None:
         self._is_panning = False
 
-    def _on_mouse_wheel(self, event: tk.Event) -> None:
-        factor = 1.1 if event.delta > 0 else 0.9
+    def _on_enter(self, event: tk.Event) -> None:
+        self.focus_set()
+
+    def _event_targets_canvas(self, event: tk.Event) -> bool:
+        try:
+            pointer_x, pointer_y = self.winfo_pointerxy()
+        except tk.TclError:
+            return False
+        widget = self.winfo_containing(pointer_x, pointer_y)
+        if widget is None:
+            return False
+        widget_name = str(widget)
+        canvas_name = str(self)
+        return widget_name == canvas_name or widget_name.startswith(f"{canvas_name}.")
+
+    def _event_view_point(self, event: tk.Event) -> tuple[float, float]:
+        try:
+            pointer_x, pointer_y = self.winfo_pointerxy()
+        except tk.TclError:
+            return 0.0, 0.0
+        return float(pointer_x - self.winfo_rootx()), float(pointer_y - self.winfo_rooty())
+
+    def _set_input_debug(self, message: str) -> None:
+        if not self._input_debug_enabled:
+            return
+        self._input_debug_text = message
+        debug_items = self.find_withtag("input_debug")
+        if debug_items:
+            self.itemconfigure(debug_items[0], text=self._input_debug_text)
+            self.update_idletasks()
+
+    def _on_canvas_mouse_wheel(self, event: tk.Event) -> str:
+        self.pan_y += event.delta
+        self._set_input_debug(f"canvas wheel pan-y delta={event.delta}")
+        self.redraw()
+        return "break"
+
+    def _on_canvas_shift_mouse_wheel(self, event: tk.Event) -> str:
+        self.pan_x += event.delta
+        self._set_input_debug(f"canvas shift-wheel pan-x delta={event.delta}")
+        self.redraw()
+        return "break"
+
+    def _on_canvas_modified_mouse_wheel(self, event: tk.Event) -> str:
+        self._set_input_debug(f"canvas mod-wheel zoom delta={event.delta}")
+        self._zoom_at_view_point(event.x, event.y, event.delta)
+        return "break"
+
+    def _on_canvas_scroll_up(self, event: tk.Event) -> str:
+        self.pan_y += 40
+        self._set_input_debug("canvas button-4 pan-y +40")
+        self.redraw()
+        return "break"
+
+    def _on_canvas_scroll_down(self, event: tk.Event) -> str:
+        self.pan_y -= 40
+        self._set_input_debug("canvas button-5 pan-y -40")
+        self.redraw()
+        return "break"
+
+    def _on_global_mouse_wheel(self, event: tk.Event) -> str | None:
+        inside = self._event_targets_canvas(event)
+        if not inside:
+            self._set_input_debug(f"wheel ignored delta={event.delta}")
+            return None
+        # On macOS trackpads, two-finger scroll emits MouseWheel with small deltas.
+        # Treat plain wheel as pan, and reserve modified wheel (Cmd/Ctrl) for zoom.
+        self.pan_y += event.delta
+        self._set_input_debug(f"wheel pan-y delta={event.delta}")
+        self.redraw()
+        return "break"
+
+    def _on_global_shift_mouse_wheel(self, event: tk.Event) -> str | None:
+        inside = self._event_targets_canvas(event)
+        if not inside:
+            self._set_input_debug(f"shift-wheel ignored delta={event.delta}")
+            return None
+        self.pan_x += event.delta
+        self._set_input_debug(f"shift-wheel pan-x delta={event.delta}")
+        self.redraw()
+        return "break"
+
+    def _on_global_modified_mouse_wheel(self, event: tk.Event) -> str | None:
+        inside = self._event_targets_canvas(event)
+        if not inside:
+            self._set_input_debug(f"mod-wheel ignored delta={event.delta}")
+            return None
+        view_x, view_y = self._event_view_point(event)
+        self._set_input_debug(f"mod-wheel zoom delta={event.delta}")
+        self._zoom_at_view_point(view_x, view_y, event.delta)
+        return "break"
+
+    def _on_global_scroll_up(self, event: tk.Event) -> str | None:
+        if not self._event_targets_canvas(event):
+            return None
+        self.pan_y += 40
+        self._set_input_debug("button-4 pan-y +40")
+        self.redraw()
+        return "break"
+
+    def _on_global_scroll_down(self, event: tk.Event) -> str | None:
+        if not self._event_targets_canvas(event):
+            return None
+        self.pan_y -= 40
+        self._set_input_debug("button-5 pan-y -40")
+        self.redraw()
+        return "break"
+
+    def _zoom_at_view_point(self, view_x: float, view_y: float, delta: float) -> None:
+        if abs(delta) < 1e-9:
+            return
+        factor = 1.1 if delta > 0 else 0.9
         new_zoom = min(3.0, max(0.4, self.zoom * factor))
         if abs(new_zoom - self.zoom) < 1e-9:
             return
-        world_x, world_y = self._view_to_world(event.x, event.y)
+        world_x, world_y = self._view_to_world(view_x, view_y)
         self.zoom = new_zoom
-        self.pan_x = event.x - world_x * self.zoom
-        self.pan_y = event.y - world_y * self.zoom
+        self.pan_x = view_x - world_x * self.zoom
+        self.pan_y = view_y - world_y * self.zoom
         self.redraw()
