@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Optional
 
-from ..model import Circuit, ComponentKind, ProcessKind, ThermoSpec
+from ..model import Circuit, ComponentKind, Edge, ProcessKind, ThermoSpec
 from ..solver import CircuitSolution, ComponentConstraintDiagnostic
 from ..unit_system import best_prefixed_display, default_unit, from_internal, is_numeric_field, to_internal, unit_names
 
@@ -103,6 +103,19 @@ class ComponentInspector(ttk.Frame):
         "pressure_drop_mpa",
         "outlet_pressure_mpa",
     }
+    _non_edge_fields = {"name", "kind", "process_kind", "inlet_definition_mode", "outlet_definition_mode", "notes"}
+    # Fields whose value lives directly on the outlet edge's spec without an "outlet_" prefix.
+    _outlet_unprefixed_fields = {
+        "heat_duty_kw",
+        "pressure_drop_mpa",
+        "mass_flow_kg_s",
+        "pipe_length_m",
+        "pipe_outer_diameter_m",
+        "pipe_wall_thickness_m",
+        "pipe_roughness_m",
+        "elevation_change_m",
+        "local_loss_coefficient",
+    }
 
     _neutral_bg = "#fcfcfc"
     _solver_bg = "#d7e7f5"
@@ -138,8 +151,6 @@ class ComponentInspector(ttk.Frame):
         self._unit_vars: dict[str, tk.StringVar] = {}
         self._unit_widgets: dict[str, ttk.Combobox] = {}
         self._unit_last: dict[str, str] = {}
-        self._propagated_fields: set[str] = set()
-        self._linked_user_fields: set[str] = set()
         self._active_fields: set[str] = set(self._base_fields)
         self._kind_values = [kind.value for kind in ComponentKind]
         self._process_values = [process.value for process in ProcessKind]
@@ -299,12 +310,22 @@ class ComponentInspector(ttk.Frame):
         combo.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_unit_changed(f))
         return combo
 
+    def _resolve_field_edge(self, field_name: str, inlet_edge: Edge, outlet_edge: Edge) -> tuple[Optional[Edge], str]:
+        """Map a prefixed inspector field name to the edge and unprefixed attribute that own it."""
+        if field_name in self._non_edge_fields:
+            return None, field_name
+        if field_name.startswith("inlet_"):
+            return inlet_edge, field_name[len("inlet_"):]
+        if field_name.startswith("outlet_") and field_name not in self._outlet_unprefixed_fields:
+            return outlet_edge, field_name[len("outlet_"):]
+        if field_name in self._outlet_unprefixed_fields:
+            return outlet_edge, field_name
+        return None, field_name
+
     def load_component(self, component_id: Optional[str]) -> None:
         self.current_component_id = component_id
         self._loading = True
         if component_id is None:
-            self._propagated_fields.clear()
-            self._linked_user_fields.clear()
             for key, var in self._vars.items():
                 var.set("")
                 if key in self._colorable_fields:
@@ -326,37 +347,22 @@ class ComponentInspector(ttk.Frame):
             component.outlet_definition_mode,
         )
 
-        values = {
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+
+        values: dict[str, float | str | None] = {
             "name": component.name,
             "kind": component.kind.value,
             "process_kind": component.process_kind.value,
             "inlet_definition_mode": component.inlet_definition_mode,
             "outlet_definition_mode": component.outlet_definition_mode,
-            "inlet_pressure_mpa": component.inlet_spec.pressure_mpa,
-            "inlet_temperature_c": component.inlet_spec.temperature_c,
-            "inlet_enthalpy_kj_kg": component.inlet_spec.enthalpy_kj_kg,
-            "inlet_entropy_kj_kgk": component.inlet_spec.entropy_kj_kgk,
-            "inlet_quality": component.inlet_spec.quality,
-            "inlet_specific_volume_m3_kg": component.inlet_spec.specific_volume_m3_kg,
-            "inlet_efficiency": component.inlet_spec.efficiency,
-            "outlet_pressure_mpa": component.outlet_spec.pressure_mpa,
-            "outlet_temperature_c": component.outlet_spec.temperature_c,
-            "outlet_enthalpy_kj_kg": component.outlet_spec.enthalpy_kj_kg,
-            "outlet_entropy_kj_kgk": component.outlet_spec.entropy_kj_kgk,
-            "outlet_quality": component.outlet_spec.quality,
-            "outlet_specific_volume_m3_kg": component.outlet_spec.specific_volume_m3_kg,
-            "outlet_efficiency": component.outlet_spec.efficiency,
-            "heat_duty_kw": component.outlet_spec.heat_duty_kw,
-            "pressure_drop_mpa": component.outlet_spec.pressure_drop_mpa,
-            "mass_flow_kg_s": component.outlet_spec.mass_flow_kg_s,
-            "pipe_length_m": component.outlet_spec.pipe_length_m,
-            "pipe_outer_diameter_m": component.outlet_spec.pipe_outer_diameter_m,
-            "pipe_wall_thickness_m": component.outlet_spec.pipe_wall_thickness_m,
-            "pipe_roughness_m": component.outlet_spec.pipe_roughness_m,
-            "elevation_change_m": component.outlet_spec.elevation_change_m,
-            "local_loss_coefficient": component.outlet_spec.local_loss_coefficient,
             "notes": component.notes,
         }
+        for field_name, _ in self.field_specs:
+            if field_name in values:
+                continue
+            edge, suffix = self._resolve_field_edge(field_name, inlet_edge, outlet_edge)
+            values[field_name] = getattr(edge.spec, suffix, None) if edge is not None else None
 
         for field_name, value in values.items():
             if field_name in self._unit_vars:
@@ -372,68 +378,8 @@ class ComponentInspector(ttk.Frame):
             else:
                 self._vars[field_name].set("" if value is None else str(value))
 
-        self._apply_propagated_inlet_fields(component)
         self._apply_highlights(component)
         self._loading = False
-
-    def _apply_propagated_inlet_fields(self, component) -> None:
-        self._propagated_fields.clear()
-        self._linked_user_fields.clear()
-        self._propagate_from_neighbor(
-            component,
-            neighbor_ids=self.circuit.incoming(component.component_id),
-            own_fields=self._inlet_state_fields,
-            own_prefix="inlet_",
-            neighbor_spec_attr="outlet_spec",
-            neighbor_state_attr="outlet_state",
-            neighbor_field_prefix="outlet_",
-        )
-        self._propagate_from_neighbor(
-            component,
-            neighbor_ids=self.circuit.outgoing(component.component_id),
-            own_fields=self._outlet_state_fields,
-            own_prefix="outlet_",
-            neighbor_spec_attr="inlet_spec",
-            neighbor_state_attr="inlet_state",
-            neighbor_field_prefix="inlet_",
-        )
-
-    def _propagate_from_neighbor(
-        self,
-        component,
-        neighbor_ids: list[str],
-        own_fields: set[str],
-        own_prefix: str,
-        neighbor_spec_attr: str,
-        neighbor_state_attr: str,
-        neighbor_field_prefix: str,
-    ) -> None:
-        if len(neighbor_ids) != 1:
-            return
-        neighbor = self.circuit.components.get(neighbor_ids[0])
-        if neighbor is None:
-            return
-        neighbor_state = getattr(neighbor, neighbor_state_attr)
-        neighbor_spec = getattr(neighbor, neighbor_spec_attr)
-        for field_name in own_fields:
-            if field_name not in self._active_fields:
-                continue
-            if field_name in component.user_input_fields:
-                continue
-            if self._vars[field_name].get().strip():
-                continue
-            suffix = field_name[len(own_prefix):]
-            value = getattr(neighbor_state, suffix, None) if neighbor_state is not None else None
-            if value is None:
-                value = getattr(neighbor_spec, suffix, None)
-            if value is None:
-                continue
-            if f"{neighbor_field_prefix}{suffix}" in neighbor.user_input_fields:
-                self._linked_user_fields.add(field_name)
-            unit = component.unit_preferences.get(field_name, default_unit(field_name))
-            converted = from_internal(field_name, value, unit)
-            self._vars[field_name].set(self._format(converted))
-            self._propagated_fields.add(field_name)
 
     def apply_to_component(self) -> None:
         if self.current_component_id is None:
@@ -452,7 +398,10 @@ class ComponentInspector(ttk.Frame):
             component.outlet_definition_mode,
         )
 
-        component.solved_fields.clear()
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+        inlet_edge.solved_fields.clear()
+        outlet_edge.solved_fields.clear()
 
         active = self._active_fields_for(
             component.kind,
@@ -461,39 +410,17 @@ class ComponentInspector(ttk.Frame):
             component.outlet_definition_mode,
         )
 
-        def parse_active(field_name: str) -> float | None:
+        for field_name, _ in self.field_specs:
+            edge, suffix = self._resolve_field_edge(field_name, inlet_edge, outlet_edge)
+            if edge is None:
+                continue
             if field_name in active:
-                return self._parse_and_track(component, field_name)
-            component.user_input_fields.discard(field_name)
-            return None
+                value = self._parse_and_track(component, edge, suffix, field_name)
+            else:
+                edge.user_input_fields.discard(suffix)
+                value = None
+            setattr(edge.spec, suffix, value)
 
-        component.inlet_spec = ThermoSpec(
-            pressure_mpa=parse_active("inlet_pressure_mpa"),
-            temperature_c=parse_active("inlet_temperature_c"),
-            enthalpy_kj_kg=parse_active("inlet_enthalpy_kj_kg"),
-            entropy_kj_kgk=parse_active("inlet_entropy_kj_kgk"),
-            quality=parse_active("inlet_quality"),
-            specific_volume_m3_kg=parse_active("inlet_specific_volume_m3_kg"),
-            efficiency=parse_active("inlet_efficiency"),
-        )
-        component.outlet_spec = ThermoSpec(
-            pressure_mpa=parse_active("outlet_pressure_mpa"),
-            temperature_c=parse_active("outlet_temperature_c"),
-            enthalpy_kj_kg=parse_active("outlet_enthalpy_kj_kg"),
-            entropy_kj_kgk=parse_active("outlet_entropy_kj_kgk"),
-            quality=parse_active("outlet_quality"),
-            specific_volume_m3_kg=parse_active("outlet_specific_volume_m3_kg"),
-            efficiency=parse_active("outlet_efficiency"),
-            heat_duty_kw=parse_active("heat_duty_kw"),
-            pressure_drop_mpa=parse_active("pressure_drop_mpa"),
-            mass_flow_kg_s=parse_active("mass_flow_kg_s"),
-            pipe_length_m=parse_active("pipe_length_m"),
-            pipe_outer_diameter_m=parse_active("pipe_outer_diameter_m"),
-            pipe_wall_thickness_m=parse_active("pipe_wall_thickness_m"),
-            pipe_roughness_m=parse_active("pipe_roughness_m"),
-            elevation_change_m=parse_active("elevation_change_m"),
-            local_loss_coefficient=parse_active("local_loss_coefficient"),
-        )
         component.notes = self._vars["notes"].get().strip()
         component.is_dirty = True
         self._apply_highlights(component)
@@ -510,36 +437,38 @@ class ComponentInspector(ttk.Frame):
         component = self.circuit.components.get(component_id)
         if component is None:
             return
-        component.conflicting_fields = set(conflicting_fields or [])
-        component.solved_fields.clear()
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+        conflicts = set(conflicting_fields or [])
+        inlet_edge.conflicting_fields = {f[len("inlet_"):] for f in conflicts if f.startswith("inlet_")}
+        outlet_edge.conflicting_fields = {
+            (f[len("outlet_"):] if f.startswith("outlet_") else f) for f in conflicts if not f.startswith("inlet_")
+        }
+        inlet_edge.solved_fields.clear()
+        outlet_edge.solved_fields.clear()
 
-        def set_if_not_user(spec_obj, field_name: str, value: float | None, scoped_name: str) -> None:
-            if scoped_name in component.user_input_fields:
+        def set_if_not_user(edge: Edge, suffix: str, value: float | None) -> None:
+            if suffix in edge.user_input_fields:
                 return
-            setattr(spec_obj, field_name, value)
-            component.solved_fields.add(scoped_name)
+            setattr(edge.spec, suffix, value)
+            edge.solved_fields.add(suffix)
 
         if inlet_state is not None:
-            set_if_not_user(component.inlet_spec, "pressure_mpa", inlet_state.pressure_mpa, "inlet_pressure_mpa")
-            set_if_not_user(component.inlet_spec, "temperature_c", inlet_state.temperature_c, "inlet_temperature_c")
-            set_if_not_user(component.inlet_spec, "enthalpy_kj_kg", inlet_state.enthalpy_kj_kg, "inlet_enthalpy_kj_kg")
-            set_if_not_user(component.inlet_spec, "entropy_kj_kgk", inlet_state.entropy_kj_kgk, "inlet_entropy_kj_kgk")
-            set_if_not_user(component.inlet_spec, "specific_volume_m3_kg", inlet_state.specific_volume_m3_kg, "inlet_specific_volume_m3_kg")
-            set_if_not_user(component.inlet_spec, "quality", inlet_state.quality, "inlet_quality")
+            set_if_not_user(inlet_edge, "pressure_mpa", inlet_state.pressure_mpa)
+            set_if_not_user(inlet_edge, "temperature_c", inlet_state.temperature_c)
+            set_if_not_user(inlet_edge, "enthalpy_kj_kg", inlet_state.enthalpy_kj_kg)
+            set_if_not_user(inlet_edge, "entropy_kj_kgk", inlet_state.entropy_kj_kgk)
+            set_if_not_user(inlet_edge, "specific_volume_m3_kg", inlet_state.specific_volume_m3_kg)
+            set_if_not_user(inlet_edge, "quality", inlet_state.quality)
         if outlet_state is not None:
-            set_if_not_user(component.outlet_spec, "pressure_mpa", outlet_state.pressure_mpa, "outlet_pressure_mpa")
-            set_if_not_user(component.outlet_spec, "temperature_c", outlet_state.temperature_c, "outlet_temperature_c")
-            set_if_not_user(component.outlet_spec, "enthalpy_kj_kg", outlet_state.enthalpy_kj_kg, "outlet_enthalpy_kj_kg")
-            set_if_not_user(component.outlet_spec, "entropy_kj_kgk", outlet_state.entropy_kj_kgk, "outlet_entropy_kj_kgk")
-            set_if_not_user(component.outlet_spec, "specific_volume_m3_kg", outlet_state.specific_volume_m3_kg, "outlet_specific_volume_m3_kg")
-            set_if_not_user(component.outlet_spec, "quality", outlet_state.quality, "outlet_quality")
+            set_if_not_user(outlet_edge, "pressure_mpa", outlet_state.pressure_mpa)
+            set_if_not_user(outlet_edge, "temperature_c", outlet_state.temperature_c)
+            set_if_not_user(outlet_edge, "enthalpy_kj_kg", outlet_state.enthalpy_kj_kg)
+            set_if_not_user(outlet_edge, "entropy_kj_kgk", outlet_state.entropy_kj_kgk)
+            set_if_not_user(outlet_edge, "specific_volume_m3_kg", outlet_state.specific_volume_m3_kg)
+            set_if_not_user(outlet_edge, "quality", outlet_state.quality)
         if inlet_state is not None and outlet_state is not None:
-            set_if_not_user(
-                component.outlet_spec,
-                "pressure_drop_mpa",
-                max(0.0, inlet_state.pressure_mpa - outlet_state.pressure_mpa),
-                "pressure_drop_mpa",
-            )
+            set_if_not_user(outlet_edge, "pressure_drop_mpa", max(0.0, inlet_state.pressure_mpa - outlet_state.pressure_mpa))
         component.is_dirty = False
         if self.current_component_id == component_id:
             self.load_component(component_id)
@@ -588,15 +517,15 @@ class ComponentInspector(ttk.Frame):
             parts.append(f"quality={best_value:.4g} {best_unit}")
         return ", ".join(parts)
 
-    def _parse_and_track(self, component, field_name: str) -> float | None:
+    def _parse_and_track(self, component, edge: Edge, suffix: str, field_name: str) -> float | None:
         raw = self._vars[field_name].get().strip()
         if not raw:
-            component.user_input_fields.discard(field_name)
+            edge.user_input_fields.discard(suffix)
             return None
         try:
             number = float(raw)
         except ValueError:
-            component.user_input_fields.discard(field_name)
+            edge.user_input_fields.discard(suffix)
             return None
         unit_name = component.unit_preferences.get(field_name, default_unit(field_name))
         return to_internal(field_name, number, unit_name)
@@ -646,10 +575,14 @@ class ComponentInspector(ttk.Frame):
                 pass
         component.unit_preferences[field_name] = new_unit
         self._unit_last[field_name] = new_unit
-        if self._vars[field_name].get().strip():
-            component.user_input_fields.add(field_name)
-        else:
-            component.user_input_fields.discard(field_name)
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+        edge, suffix = self._resolve_field_edge(field_name, inlet_edge, outlet_edge)
+        if edge is not None:
+            if self._vars[field_name].get().strip():
+                edge.user_input_fields.add(suffix)
+            else:
+                edge.user_input_fields.discard(suffix)
         self._clear_highlights_dirty(component)
 
     def _on_any_field_modified(self, field_name: str) -> None:
@@ -669,37 +602,45 @@ class ComponentInspector(ttk.Frame):
             outlet_mode = self._vars["outlet_definition_mode"].get().strip() or component.outlet_definition_mode
             self._update_field_visibility(kind, process, inlet_mode, outlet_mode)
         if is_numeric_field(field_name):
-            if self._vars[field_name].get().strip():
-                component.user_input_fields.add(field_name)
-            else:
-                component.user_input_fields.discard(field_name)
-            self._propagated_fields.discard(field_name)
+            inlet_edge = self.circuit.inlet_edge(component)
+            outlet_edge = self.circuit.outlet_edge(component)
+            edge, suffix = self._resolve_field_edge(field_name, inlet_edge, outlet_edge)
+            if edge is not None:
+                if self._vars[field_name].get().strip():
+                    edge.user_input_fields.add(suffix)
+                else:
+                    edge.user_input_fields.discard(suffix)
         self._clear_highlights_dirty(component)
 
     def _clear_highlights_dirty(self, component) -> None:
-        component.solved_fields.clear()
-        component.conflicting_fields.clear()
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+        inlet_edge.solved_fields.clear()
+        outlet_edge.solved_fields.clear()
+        inlet_edge.conflicting_fields.clear()
+        outlet_edge.conflicting_fields.clear()
         component.is_dirty = True
-        self._apply_propagated_inlet_fields(component)
         self._apply_highlights(component)
         if self.on_dirty:
             self.on_dirty()
 
     def _apply_highlights(self, component) -> None:
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
         overdefined = self._is_overdefined_for_non_general(component)
         for field_name in self._colorable_fields:
             widget = self._widgets[field_name]
             if field_name not in self._active_fields:
                 continue
+            edge, suffix = self._resolve_field_edge(field_name, inlet_edge, outlet_edge)
             color = self._neutral_bg
-            if field_name in self._propagated_fields:
-                color = self._link_bg
-            if field_name in component.user_input_fields:
-                color = self._input_bg
-            if not component.is_dirty and field_name in component.solved_fields:
-                color = self._solver_bg
-            if field_name in component.conflicting_fields:
-                color = self._conflict_bg
+            if edge is not None:
+                if suffix in edge.user_input_fields:
+                    color = self._input_bg
+                if not component.is_dirty and suffix in edge.solved_fields:
+                    color = self._solver_bg
+                if suffix in edge.conflicting_fields:
+                    color = self._conflict_bg
             widget.configure(bg=color)
 
         for field_name, label in self._labels.items():
@@ -720,18 +661,21 @@ class ComponentInspector(ttk.Frame):
         outlet_mode = (outlet_mode_var.get() if outlet_mode_var is not None else "") or component.outlet_definition_mode
         inlet_required = self._definition_fields_for_mode("inlet", inlet_mode)
         outlet_required = self._definition_fields_for_mode("outlet", outlet_mode)
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
 
-        def complete(required: set[str]) -> bool:
+        def complete(required: set[str], edge: Edge) -> bool:
             for field_name in required:
                 if field_name not in self._active_fields:
                     continue
-                if field_name not in component.user_input_fields and field_name not in self._linked_user_fields:
+                suffix = field_name.split("_", 1)[1]
+                if suffix not in edge.user_input_fields:
                     return False
                 if not self._vars[field_name].get().strip():
                     return False
             return True
 
-        return complete(inlet_required) and complete(outlet_required)
+        return complete(inlet_required, inlet_edge) and complete(outlet_required, outlet_edge)
 
     def solve_requested(self) -> None:
         if self.on_solve:

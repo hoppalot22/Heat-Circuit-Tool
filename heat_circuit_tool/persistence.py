@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
-from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
+from .model import Circuit, Component, ComponentKind, Edge, ProcessKind, ThermoSpec
 from .thermo import ThermoState
+
+SAVE_FORMAT_VERSION = 2
+_THERMO_SPEC_FIELD_NAMES = [f.name for f in fields(ThermoSpec)]
 
 
 def _spec_to_dict(spec: ThermoSpec) -> dict[str, Any]:
@@ -79,11 +82,34 @@ def _state_from_dict(data: dict[str, Any] | None) -> ThermoState | None:
     )
 
 
+def _edge_to_dict(edge: Edge) -> dict[str, Any]:
+    return {
+        "edge_id": edge.edge_id,
+        "spec": _spec_to_dict(edge.spec),
+        "state": _state_to_dict(edge.state),
+        "user_input_fields": sorted(edge.user_input_fields),
+        "solved_fields": sorted(edge.solved_fields),
+        "conflicting_fields": sorted(edge.conflicting_fields),
+    }
+
+
+def _edge_from_dict(data: dict[str, Any]) -> Edge:
+    return Edge(
+        edge_id=data["edge_id"],
+        spec=_spec_from_dict(data.get("spec", {})),
+        state=_state_from_dict(data.get("state")),
+        user_input_fields=set(data.get("user_input_fields", [])),
+        solved_fields=set(data.get("solved_fields", [])),
+        conflicting_fields=set(data.get("conflicting_fields", [])),
+    )
+
+
 def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
     return {
         "start_component_id": circuit.start_component_id,
         "seed_state": _state_to_dict(circuit.seed_state),
         "seed_description": circuit.seed_description,
+        "edges": [_edge_to_dict(edge) for edge in circuit.edges.values()],
         "components": [
             {
                 "component_id": component.component_id,
@@ -94,19 +120,14 @@ def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
                 "y": component.y,
                 "width": component.width,
                 "height": component.height,
-                "inlet_spec": _spec_to_dict(component.inlet_spec),
-                "outlet_spec": _spec_to_dict(component.outlet_spec),
                 "notes": component.notes,
                 "upstream_ids": list(component.upstream_ids),
                 "downstream_ids": list(component.downstream_ids),
-                "inlet_state": _state_to_dict(component.inlet_state),
-                "outlet_state": _state_to_dict(component.outlet_state),
+                "inlet_edge_id": component.inlet_edge_id,
+                "outlet_edge_id": component.outlet_edge_id,
                 "unit_preferences": dict(component.unit_preferences),
                 "inlet_definition_mode": component.inlet_definition_mode,
                 "outlet_definition_mode": component.outlet_definition_mode,
-                "user_input_fields": sorted(component.user_input_fields),
-                "solved_fields": sorted(component.solved_fields),
-                "conflicting_fields": sorted(component.conflicting_fields),
                 "is_dirty": component.is_dirty,
                 "report": component.report,
             }
@@ -116,12 +137,20 @@ def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
 
 
 def circuit_from_dict(data: dict[str, Any]) -> Circuit:
+    if "edges" not in data:
+        return _circuit_from_legacy_dict(data)
+
     circuit = Circuit(
         components={},
+        edges={},
         start_component_id=data.get("start_component_id"),
         seed_state=_state_from_dict(data.get("seed_state")),
         seed_description=data.get("seed_description", ""),
     )
+
+    for edge_item in data.get("edges", []):
+        edge = _edge_from_dict(edge_item)
+        circuit.edges[edge.edge_id] = edge
 
     for item in data.get("components", []):
         component = Component(
@@ -133,23 +162,124 @@ def circuit_from_dict(data: dict[str, Any]) -> Circuit:
             y=float(item.get("y", 0.0)),
             width=float(item.get("width", 180.0)),
             height=float(item.get("height", 92.0)),
-            inlet_spec=_spec_from_dict(item.get("inlet_spec", {})),
-            outlet_spec=_spec_from_dict(item.get("outlet_spec", {})),
             notes=item.get("notes", ""),
             upstream_ids=list(item.get("upstream_ids", [])),
             downstream_ids=list(item.get("downstream_ids", [])),
-            inlet_state=_state_from_dict(item.get("inlet_state")),
-            outlet_state=_state_from_dict(item.get("outlet_state")),
+            inlet_edge_id=item.get("inlet_edge_id", ""),
+            outlet_edge_id=item.get("outlet_edge_id", ""),
             unit_preferences=dict(item.get("unit_preferences", {})),
             inlet_definition_mode=item.get("inlet_definition_mode", "Auto"),
             outlet_definition_mode=item.get("outlet_definition_mode", "Auto"),
-            user_input_fields=set(item.get("user_input_fields", [])),
-            solved_fields=set(item.get("solved_fields", [])),
-            conflicting_fields=set(item.get("conflicting_fields", [])),
             is_dirty=bool(item.get("is_dirty", True)),
             report=item.get("report", ""),
         )
-        circuit.components[component.component_id] = component
+        circuit.add_component(component)
+    return circuit
+
+
+def _circuit_from_legacy_dict(data: dict[str, Any]) -> Circuit:
+    """Migrate a pre-refactor (version < 2) save file into the edge-owned model.
+
+    Legacy files stored per-component ``inlet_spec``/``outlet_spec`` (and their
+    solved-state/field-tracking counterparts) instead of shared edges. For each
+    connected pair, the upstream outlet data and downstream inlet data described
+    the same physical state, so they are merged into one new edge (preferring
+    user-entered values, then falling back to whichever side has a value).
+    """
+    circuit = Circuit(
+        components={},
+        edges={},
+        start_component_id=data.get("start_component_id"),
+        seed_state=_state_from_dict(data.get("seed_state")),
+        seed_description=data.get("seed_description", ""),
+    )
+
+    legacy_items = {item["component_id"]: item for item in data.get("components", [])}
+
+    for item in legacy_items.values():
+        component = Component(
+            component_id=item["component_id"],
+            kind=ComponentKind(item["kind"]),
+            process_kind=ProcessKind(item["process_kind"]),
+            name=item.get("name", item["component_id"]),
+            x=float(item.get("x", 0.0)),
+            y=float(item.get("y", 0.0)),
+            width=float(item.get("width", 180.0)),
+            height=float(item.get("height", 92.0)),
+            notes=item.get("notes", ""),
+            upstream_ids=list(item.get("upstream_ids", [])),
+            downstream_ids=list(item.get("downstream_ids", [])),
+            unit_preferences=dict(item.get("unit_preferences", {})),
+            inlet_definition_mode=item.get("inlet_definition_mode", "Auto"),
+            outlet_definition_mode=item.get("outlet_definition_mode", "Auto"),
+            is_dirty=bool(item.get("is_dirty", True)),
+            report=item.get("report", ""),
+        )
+        circuit.add_component(component)
+
+    # First pass: seed each component's own boundary edges from its legacy data.
+    for item in legacy_items.values():
+        component = circuit.components[item["component_id"]]
+        inlet_edge = circuit.inlet_edge(component)
+        outlet_edge = circuit.outlet_edge(component)
+        inlet_edge.spec = _spec_from_dict(item.get("inlet_spec", {}))
+        outlet_edge.spec = _spec_from_dict(item.get("outlet_spec", {}))
+        inlet_edge.state = _state_from_dict(item.get("inlet_state"))
+        outlet_edge.state = _state_from_dict(item.get("outlet_state"))
+        legacy_user_fields = set(item.get("user_input_fields", []))
+        legacy_solved_fields = set(item.get("solved_fields", []))
+        legacy_conflicting_fields = set(item.get("conflicting_fields", []))
+        for field_name in legacy_user_fields:
+            if field_name.startswith("inlet_"):
+                inlet_edge.user_input_fields.add(field_name[len("inlet_"):])
+            elif field_name.startswith("outlet_"):
+                outlet_edge.user_input_fields.add(field_name[len("outlet_"):])
+            else:
+                outlet_edge.user_input_fields.add(field_name)
+        for field_name in legacy_solved_fields:
+            if field_name.startswith("inlet_"):
+                inlet_edge.solved_fields.add(field_name[len("inlet_"):])
+            elif field_name.startswith("outlet_"):
+                outlet_edge.solved_fields.add(field_name[len("outlet_"):])
+            else:
+                outlet_edge.solved_fields.add(field_name)
+        for field_name in legacy_conflicting_fields:
+            if field_name.startswith("inlet_"):
+                inlet_edge.conflicting_fields.add(field_name[len("inlet_"):])
+            elif field_name.startswith("outlet_"):
+                outlet_edge.conflicting_fields.add(field_name[len("outlet_"):])
+            else:
+                outlet_edge.conflicting_fields.add(field_name)
+
+    # Second pass: for each connected pair, merge the upstream outlet edge and
+    # downstream inlet edge into a single shared edge (upstream's edge wins,
+    # preferring user-entered fields from either side over solved-only values).
+    for item in legacy_items.values():
+        downstream = circuit.components[item["component_id"]]
+        for upstream_id in item.get("upstream_ids", []):
+            upstream = circuit.components.get(upstream_id)
+            if upstream is None or upstream_id not in legacy_items:
+                continue
+            if len(downstream.upstream_ids) != 1 or len(upstream.downstream_ids) != 1:
+                # Mixer/splitter junction: keep each side's own edge (out of scope).
+                continue
+            shared_edge = circuit.outlet_edge(upstream)
+            downstream_edge = circuit.inlet_edge(downstream)
+            if shared_edge is downstream_edge:
+                continue
+            merged_user_fields = shared_edge.user_input_fields | downstream_edge.user_input_fields
+            for attr in _THERMO_SPEC_FIELD_NAMES:
+                downstream_value = getattr(downstream_edge.spec, attr)
+                if downstream_value is None:
+                    continue
+                upstream_value = getattr(shared_edge.spec, attr)
+                if upstream_value is None or (attr in downstream_edge.user_input_fields and attr not in shared_edge.user_input_fields):
+                    setattr(shared_edge.spec, attr, downstream_value)
+            shared_edge.user_input_fields = merged_user_fields
+            shared_edge.state = shared_edge.state or downstream_edge.state
+            circuit.edges.pop(downstream.inlet_edge_id, None)
+            downstream.inlet_edge_id = shared_edge.edge_id
+
     return circuit
 
 
@@ -160,7 +290,7 @@ def save_project_file(
     latest_solved: dict[str, Any] | None = None,
 ) -> None:
     payload = {
-        "version": 1,
+        "version": SAVE_FORMAT_VERSION,
         "active_circuit": circuit_to_dict(circuit),
         "snapshots": snapshots,
         "latest_solved": latest_solved,

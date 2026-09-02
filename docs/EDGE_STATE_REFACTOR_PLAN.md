@@ -1,8 +1,13 @@
 # Refactor Plan: Edge-Owned Thermodynamic State
 
 ## Status
-Not started. This document is a scoping/instruction doc to be executed in a
-dedicated session, separate from day-to-day feature work.
+Complete. Implemented across `model.py`, `solver.py`, `persistence.py` (with a
+version-2 migration path for legacy save files), `presets.py`,
+`solve_logging.py`, `demo.py`, and the UI layer (`inspector.py`, `canvas.py`,
+`main_window.py`). `tests/test_constraint_system.py` was updated to build
+circuits via `circuit.connect(...)` and configure edges directly. All existing
+tests pass, plus manual verification of solving, save/load round-trips, legacy
+migration, and shared-edge propagation between connected components.
 
 ## Problem statement
 Today, thermodynamic state is duplicated per component: each `Component` owns

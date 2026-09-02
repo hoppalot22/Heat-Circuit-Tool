@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
-from .model import Component, ComponentKind, ProcessKind, ThermoSpec
+from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
+
+_THERMO_SPEC_FIELD_NAMES = [f.name for f in fields(ThermoSpec)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,45 +113,19 @@ def preset_names() -> list[str]:
     return sorted(PRESETS.keys())
 
 
-def apply_preset(component: Component, preset_name: str) -> None:
+def apply_preset(circuit: Circuit, component: Component, preset_name: str) -> None:
+    """Apply a preset to a component that has already been added to `circuit`.
+
+    Presets describe single, unconnected components, so this always writes into
+    the component's own boundary edges (created by `Circuit.add_component`).
+    """
     preset = PRESETS[preset_name]
     component.kind = preset.kind
     component.process_kind = preset.process_kind
     component.name = preset.name
-    component.inlet_spec = ThermoSpec(
-        pressure_mpa=preset.inlet_spec.pressure_mpa,
-        temperature_c=preset.inlet_spec.temperature_c,
-        enthalpy_kj_kg=preset.inlet_spec.enthalpy_kj_kg,
-        entropy_kj_kgk=preset.inlet_spec.entropy_kj_kgk,
-        quality=preset.inlet_spec.quality,
-        specific_volume_m3_kg=preset.inlet_spec.specific_volume_m3_kg,
-        efficiency=preset.inlet_spec.efficiency,
-        heat_duty_kw=preset.inlet_spec.heat_duty_kw,
-        pressure_drop_mpa=preset.inlet_spec.pressure_drop_mpa,
-        mass_flow_kg_s=preset.inlet_spec.mass_flow_kg_s,
-        pipe_length_m=preset.inlet_spec.pipe_length_m,
-        pipe_outer_diameter_m=preset.inlet_spec.pipe_outer_diameter_m,
-        pipe_wall_thickness_m=preset.inlet_spec.pipe_wall_thickness_m,
-        pipe_roughness_m=preset.inlet_spec.pipe_roughness_m,
-        elevation_change_m=preset.inlet_spec.elevation_change_m,
-        local_loss_coefficient=preset.inlet_spec.local_loss_coefficient,
-    )
-    component.outlet_spec = ThermoSpec(
-        pressure_mpa=preset.outlet_spec.pressure_mpa,
-        temperature_c=preset.outlet_spec.temperature_c,
-        enthalpy_kj_kg=preset.outlet_spec.enthalpy_kj_kg,
-        entropy_kj_kgk=preset.outlet_spec.entropy_kj_kgk,
-        quality=preset.outlet_spec.quality,
-        specific_volume_m3_kg=preset.outlet_spec.specific_volume_m3_kg,
-        efficiency=preset.outlet_spec.efficiency,
-        heat_duty_kw=preset.outlet_spec.heat_duty_kw,
-        pressure_drop_mpa=preset.outlet_spec.pressure_drop_mpa,
-        mass_flow_kg_s=preset.outlet_spec.mass_flow_kg_s,
-        pipe_length_m=preset.outlet_spec.pipe_length_m,
-        pipe_outer_diameter_m=preset.outlet_spec.pipe_outer_diameter_m,
-        pipe_wall_thickness_m=preset.outlet_spec.pipe_wall_thickness_m,
-        pipe_roughness_m=preset.outlet_spec.pipe_roughness_m,
-        elevation_change_m=preset.outlet_spec.elevation_change_m,
-        local_loss_coefficient=preset.outlet_spec.local_loss_coefficient,
-    )
+    inlet_edge = circuit.inlet_edge(component)
+    outlet_edge = circuit.outlet_edge(component)
+    for attr in _THERMO_SPEC_FIELD_NAMES:
+        setattr(inlet_edge.spec, attr, getattr(preset.inlet_spec, attr))
+        setattr(outlet_edge.spec, attr, getattr(preset.outlet_spec, attr))
     component.notes = preset.notes

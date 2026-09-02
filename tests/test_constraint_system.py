@@ -19,6 +19,7 @@ def make_seed_state() -> ThermoState:
 
 
 def make_component(
+    circuit: Circuit,
     component_id: str,
     *,
     name: str,
@@ -33,10 +34,21 @@ def make_component(
         kind=kind,
         process_kind=process_kind,
         name=name,
-        inlet_spec=inlet_spec or ThermoSpec(),
-        outlet_spec=outlet_spec or ThermoSpec(),
     )
-    component.user_input_fields = user_input_fields or set()
+    circuit.add_component(component)
+    inlet_edge = circuit.inlet_edge(component)
+    outlet_edge = circuit.outlet_edge(component)
+    if inlet_spec is not None:
+        inlet_edge.spec = inlet_spec
+    if outlet_spec is not None:
+        outlet_edge.spec = outlet_spec
+    for field_name in user_input_fields or set():
+        if field_name.startswith("inlet_"):
+            inlet_edge.user_input_fields.add(field_name[len("inlet_"):])
+        elif field_name.startswith("outlet_"):
+            outlet_edge.user_input_fields.add(field_name[len("outlet_"):])
+        else:
+            outlet_edge.user_input_fields.add(field_name)
     return component
 
 
@@ -56,89 +68,81 @@ def build_sample_setups() -> list[SampleSetup]:
     empty_circuit = Circuit()
 
     blocked_circuit = Circuit()
-    blocked_circuit.add_component(
-        make_component(
-            "B1",
-            name="Boiler",
-            user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
-        )
+    make_component(
+        blocked_circuit,
+        "B1",
+        name="Boiler",
+        user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
     )
 
     underconstrained_frontier = Circuit(seed_state=make_seed_state())
-    underconstrained_frontier.add_component(
-        make_component(
-            "B1",
-            name="Boiler",
-            user_input_fields={"outlet_pressure_mpa"},
-        )
+    make_component(
+        underconstrained_frontier,
+        "B1",
+        name="Boiler",
+        user_input_fields={"outlet_pressure_mpa"},
     )
 
     well_defined_single = Circuit(seed_state=make_seed_state())
-    well_defined_single.add_component(
-        make_component(
-            "B1",
-            name="Boiler",
-            user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
-            outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=200.0),
-        )
+    make_component(
+        well_defined_single,
+        "B1",
+        name="Boiler",
+        user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
+        outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=200.0),
     )
 
     underconstrained_chain = Circuit(seed_state=make_seed_state())
-    underconstrained_chain.add_component(
-        make_component(
-            "B1",
-            name="Boiler",
-            user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
-            outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=220.0),
-        )
+    make_component(
+        underconstrained_chain,
+        "B1",
+        name="Boiler",
+        user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
+        outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=220.0),
     )
-    underconstrained_chain.add_component(
-        make_component(
-            "T1",
-            name="Turbine",
-            kind=ComponentKind.TURBINE,
-            process_kind=ProcessKind.ISENTROPIC,
-            user_input_fields={"outlet_pressure_mpa"},
-        )
+    make_component(
+        underconstrained_chain,
+        "T1",
+        name="Turbine",
+        kind=ComponentKind.TURBINE,
+        process_kind=ProcessKind.ISENTROPIC,
+        user_input_fields={"outlet_pressure_mpa"},
     )
     underconstrained_chain.connect("B1", "T1")
 
     overconstrained_turbine = Circuit(seed_state=make_seed_state())
-    overconstrained_turbine.add_component(
-        make_component(
-            "T1",
-            name="Turbine",
-            kind=ComponentKind.TURBINE,
-            process_kind=ProcessKind.ISENTROPIC,
-            user_input_fields={
-                "outlet_pressure_mpa",
-                "outlet_temperature_c",
-                "outlet_enthalpy_kj_kg",
-            },
-            outlet_spec=ThermoSpec(
-                pressure_mpa=0.1,
-                temperature_c=120.0,
-                enthalpy_kj_kg=2600.0,
-            ),
-        )
+    make_component(
+        overconstrained_turbine,
+        "T1",
+        name="Turbine",
+        kind=ComponentKind.TURBINE,
+        process_kind=ProcessKind.ISENTROPIC,
+        user_input_fields={
+            "outlet_pressure_mpa",
+            "outlet_temperature_c",
+            "outlet_enthalpy_kj_kg",
+        },
+        outlet_spec=ThermoSpec(
+            pressure_mpa=0.1,
+            temperature_c=120.0,
+            enthalpy_kj_kg=2600.0,
+        ),
     )
 
     mixer_chain = Circuit(seed_state=make_seed_state())
-    mixer_chain.add_component(
-        make_component(
-            "B1",
-            name="Boiler",
-            user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
-            outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=210.0),
-        )
+    make_component(
+        mixer_chain,
+        "B1",
+        name="Boiler",
+        user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
+        outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=210.0),
     )
-    mixer_chain.add_component(
-        make_component(
-            "M1",
-            name="Mixer",
-            kind=ComponentKind.MIXER,
-            process_kind=ProcessKind.GENERAL,
-        )
+    make_component(
+        mixer_chain,
+        "M1",
+        name="Mixer",
+        kind=ComponentKind.MIXER,
+        process_kind=ProcessKind.GENERAL,
     )
     mixer_chain.connect("B1", "M1")
 
@@ -207,7 +211,7 @@ class ConstraintSystemTests(unittest.TestCase):
     def test_traversal_order_visits_breadth_first_then_disconnected_nodes(self) -> None:
         circuit = Circuit()
         for component_id, name in (("A", "A"), ("B", "B"), ("C", "C"), ("D", "D")):
-            circuit.add_component(make_component(component_id, name=name))
+            make_component(circuit, component_id, name=name)
         circuit.connect("A", "B")
         circuit.connect("A", "C")
 
@@ -218,7 +222,7 @@ class ConstraintSystemTests(unittest.TestCase):
     def test_traversal_order_ignores_cycles_without_repeating_components(self) -> None:
         circuit = Circuit()
         for component_id in ("A", "B", "C"):
-            circuit.add_component(make_component(component_id, name=component_id))
+            make_component(circuit, component_id, name=component_id)
         circuit.connect("A", "B")
         circuit.connect("B", "C")
         circuit.connect("C", "A")
@@ -230,7 +234,7 @@ class ConstraintSystemTests(unittest.TestCase):
     def test_ordered_path_follows_first_downstream_chain_and_stops_on_cycle(self) -> None:
         circuit = Circuit()
         for component_id in ("A", "B", "C"):
-            circuit.add_component(make_component(component_id, name=component_id))
+            make_component(circuit, component_id, name=component_id)
         circuit.connect("A", "B")
         circuit.connect("B", "C")
         circuit.connect("C", "A")
@@ -242,7 +246,7 @@ class ConstraintSystemTests(unittest.TestCase):
     def test_ordered_path_uses_first_downstream_branch_only(self) -> None:
         circuit = Circuit()
         for component_id in ("A", "B", "C"):
-            circuit.add_component(make_component(component_id, name=component_id))
+            make_component(circuit, component_id, name=component_id)
         circuit.connect("A", "B")
         circuit.connect("A", "C")
 
@@ -277,7 +281,7 @@ class ConstraintSystemTests(unittest.TestCase):
 
     def test_start_component_without_seed_is_blocked(self) -> None:
         circuit = Circuit()
-        circuit.add_component(make_component("B1", name="Boiler", user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"}))
+        make_component(circuit, "B1", name="Boiler", user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"})
 
         diagnostics = analyze_constraint_system(circuit)
 
@@ -287,12 +291,11 @@ class ConstraintSystemTests(unittest.TestCase):
 
     def test_upstream_ready_component_with_one_missing_target_is_underconstrained(self) -> None:
         circuit = Circuit(seed_state=make_seed_state())
-        circuit.add_component(
-            make_component(
-                "B1",
-                name="Boiler",
-                user_input_fields={"outlet_pressure_mpa"},
-            )
+        make_component(
+            circuit,
+            "B1",
+            name="Boiler",
+            user_input_fields={"outlet_pressure_mpa"},
         )
 
         diagnostics = analyze_constraint_system(circuit)
@@ -305,13 +308,12 @@ class ConstraintSystemTests(unittest.TestCase):
 
     def test_well_defined_component_is_classified_as_solved_frontier(self) -> None:
         circuit = Circuit(seed_state=make_seed_state())
-        circuit.add_component(
-            make_component(
-                "B1",
-                name="Boiler",
-                user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
-                outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=200.0),
-            )
+        make_component(
+            circuit,
+            "B1",
+            name="Boiler",
+            user_input_fields={"outlet_pressure_mpa", "outlet_temperature_c"},
+            outlet_spec=ThermoSpec(pressure_mpa=1.0, temperature_c=200.0),
         )
 
         diagnostics = analyze_constraint_system(circuit)
@@ -323,23 +325,22 @@ class ConstraintSystemTests(unittest.TestCase):
 
     def test_overconstrained_component_takes_precedence(self) -> None:
         circuit = Circuit(seed_state=make_seed_state())
-        circuit.add_component(
-            make_component(
-                "T1",
-                name="Turbine",
-                kind=ComponentKind.TURBINE,
-                process_kind=ProcessKind.ISENTROPIC,
-                user_input_fields={
-                    "outlet_pressure_mpa",
-                    "outlet_temperature_c",
-                    "outlet_enthalpy_kj_kg",
-                },
-                outlet_spec=ThermoSpec(
-                    pressure_mpa=0.1,
-                    temperature_c=120.0,
-                    enthalpy_kj_kg=2600.0,
-                ),
-            )
+        make_component(
+            circuit,
+            "T1",
+            name="Turbine",
+            kind=ComponentKind.TURBINE,
+            process_kind=ProcessKind.ISENTROPIC,
+            user_input_fields={
+                "outlet_pressure_mpa",
+                "outlet_temperature_c",
+                "outlet_enthalpy_kj_kg",
+            },
+            outlet_spec=ThermoSpec(
+                pressure_mpa=0.1,
+                temperature_c=120.0,
+                enthalpy_kj_kg=2600.0,
+            ),
         )
 
         diagnostics = analyze_constraint_system(circuit)

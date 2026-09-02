@@ -667,12 +667,13 @@ class NodeCanvas(tk.Canvas):
             font=("Segoe UI", 9, "italic"),
             tags=("component_text", f"component:{component.component_id}"),
         )
-        if component.outlet_state is not None:
+        outlet_state = self.circuit.outlet_edge(component).state
+        if outlet_state is not None:
             self.create_text(
                 x1 + 12,
                 y1 + 72,
                 anchor="w",
-                text=f"P={component.outlet_state.pressure_mpa:.3f} MPa  h={component.outlet_state.enthalpy_kj_kg:.1f}",
+                text=f"P={outlet_state.pressure_mpa:.3f} MPa  h={outlet_state.enthalpy_kj_kg:.1f}",
                 fill="#d8f1ff",
                 font=("Segoe UI", 8),
                 tags=("component_text", f"component:{component.component_id}"),

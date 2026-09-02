@@ -125,6 +125,23 @@ class ThermoSpec:
 
 
 @dataclass(slots=True)
+class Edge:
+    """Shared thermodynamic state for one connection (or boundary port) between components.
+
+    An edge is the single owner of the spec/state/field-tracking data for the physical
+    state at a point in the circuit. Both the upstream component's outlet and the
+    downstream component's inlet reference the *same* `Edge` instance once connected.
+    """
+
+    edge_id: str
+    spec: ThermoSpec = field(default_factory=ThermoSpec)
+    state: Optional[ThermoState] = None
+    user_input_fields: set[str] = field(default_factory=set)
+    solved_fields: set[str] = field(default_factory=set)
+    conflicting_fields: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class Component:
     component_id: str
     kind: ComponentKind
@@ -134,19 +151,14 @@ class Component:
     y: float = 0.0
     width: float = 180.0
     height: float = 92.0
-    inlet_spec: ThermoSpec = field(default_factory=ThermoSpec)
-    outlet_spec: ThermoSpec = field(default_factory=ThermoSpec)
     notes: str = ""
     upstream_ids: list[str] = field(default_factory=list)
     downstream_ids: list[str] = field(default_factory=list)
-    inlet_state: Optional[ThermoState] = None
-    outlet_state: Optional[ThermoState] = None
+    inlet_edge_id: str = ""
+    outlet_edge_id: str = ""
     unit_preferences: dict[str, str] = field(default_factory=dict)
     inlet_definition_mode: str = "Auto"
     outlet_definition_mode: str = "Auto"
-    user_input_fields: set[str] = field(default_factory=set)
-    solved_fields: set[str] = field(default_factory=set)
-    conflicting_fields: set[str] = field(default_factory=set)
     is_dirty: bool = True
     report: str = ""
 
@@ -176,10 +188,6 @@ class Component:
         return self.x + self.width, self.y + self.height / 2.0
 
     def reset_results(self) -> None:
-        self.inlet_state = None
-        self.outlet_state = None
-        self.solved_fields.clear()
-        self.conflicting_fields.clear()
         self.report = ""
 
     def label(self) -> str:
@@ -189,6 +197,7 @@ class Component:
 @dataclass(slots=True)
 class Circuit:
     components: dict[str, Component] = field(default_factory=dict)
+    edges: dict[str, Edge] = field(default_factory=dict)
     start_component_id: str | None = None
     seed_state: ThermoState | None = None
     seed_description: str = ""
@@ -197,6 +206,34 @@ class Circuit:
         self.components[component.component_id] = component
         if self.start_component_id is None:
             self.start_component_id = component.component_id
+        if not component.inlet_edge_id:
+            component.inlet_edge_id = f"{component.component_id}:inlet"
+        if component.inlet_edge_id not in self.edges:
+            self.edges[component.inlet_edge_id] = Edge(edge_id=component.inlet_edge_id)
+        if not component.outlet_edge_id:
+            component.outlet_edge_id = f"{component.component_id}:outlet"
+        if component.outlet_edge_id not in self.edges:
+            self.edges[component.outlet_edge_id] = Edge(edge_id=component.outlet_edge_id)
+
+    def inlet_edge(self, component: Component) -> Edge:
+        return self.edges.setdefault(component.inlet_edge_id, Edge(edge_id=component.inlet_edge_id))
+
+    def outlet_edge(self, component: Component) -> Edge:
+        return self.edges.setdefault(component.outlet_edge_id, Edge(edge_id=component.outlet_edge_id))
+
+    def edge_for(self, component_id: str, side: str) -> Optional[Edge]:
+        component = self.components.get(component_id)
+        if component is None:
+            return None
+        return self.inlet_edge(component) if side == "inlet" else self.outlet_edge(component)
+
+    def _fresh_boundary_edge(self, component: Component, side: str) -> None:
+        edge_id = f"{component.component_id}:{side}"
+        self.edges[edge_id] = Edge(edge_id=edge_id)
+        if side == "inlet":
+            component.inlet_edge_id = edge_id
+        else:
+            component.outlet_edge_id = edge_id
 
     def remove_component(self, component_id: str) -> None:
         component = self.components.pop(component_id, None)
@@ -205,6 +242,12 @@ class Circuit:
         for other in self.components.values():
             other.upstream_ids = [item for item in other.upstream_ids if item != component_id]
             other.downstream_ids = [item for item in other.downstream_ids if item != component_id]
+            if other.inlet_edge_id == component.outlet_edge_id:
+                self._fresh_boundary_edge(other, "inlet")
+            if other.outlet_edge_id == component.inlet_edge_id:
+                self._fresh_boundary_edge(other, "outlet")
+        self.edges.pop(component.inlet_edge_id, None)
+        self.edges.pop(component.outlet_edge_id, None)
         if self.start_component_id == component_id:
             self.start_component_id = next(iter(self.components), None)
 
@@ -217,6 +260,13 @@ class Circuit:
             source.downstream_ids.append(target_id)
         if source_id not in target.upstream_ids:
             target.upstream_ids.append(source_id)
+        # Only merge into a single shared edge when this is the sole primary
+        # connection on both sides (mixers/splitters keep their own edges for
+        # secondary connections; see EDGE_STATE_REFACTOR_PLAN "Out of scope").
+        if len(source.downstream_ids) == 1 and len(target.upstream_ids) == 1:
+            if target.inlet_edge_id != source.outlet_edge_id:
+                self.edges.pop(target.inlet_edge_id, None)
+                target.inlet_edge_id = source.outlet_edge_id
 
     def disconnect(self, source_id: str, target_id: str) -> None:
         source = self.components.get(source_id)
@@ -225,6 +275,9 @@ class Circuit:
             source.downstream_ids = [item for item in source.downstream_ids if item != target_id]
         if target:
             target.upstream_ids = [item for item in target.upstream_ids if item != source_id]
+        if source and target and source.outlet_edge_id == target.inlet_edge_id:
+            self._fresh_boundary_edge(source, "outlet")
+            self._fresh_boundary_edge(target, "inlet")
 
     def outgoing(self, component_id: str) -> list[str]:
         component = self.components.get(component_id)

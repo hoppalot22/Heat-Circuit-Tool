@@ -27,6 +27,8 @@ def _state_to_dict(state: ThermoState | None) -> dict[str, Any] | None:
 def _component_debug(circuit: Circuit) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for component in circuit.components.values():
+        inlet_edge = circuit.inlet_edge(component)
+        outlet_edge = circuit.outlet_edge(component)
         rows.append(
             {
                 "component_id": component.component_id,
@@ -35,15 +37,24 @@ def _component_debug(circuit: Circuit) -> list[dict[str, Any]]:
                 "process_kind": component.process_kind.value,
                 "upstream_ids": list(component.upstream_ids),
                 "downstream_ids": list(component.downstream_ids),
-                "inlet_spec": component.inlet_spec.pretty(),
-                "outlet_spec": component.outlet_spec.pretty(),
+                "inlet_spec": inlet_edge.spec.pretty(),
+                "outlet_spec": outlet_edge.spec.pretty(),
                 "unit_preferences": dict(component.unit_preferences),
-                "user_input_fields": sorted(component.user_input_fields),
-                "solved_fields": sorted(component.solved_fields),
-                "conflicting_fields": sorted(component.conflicting_fields),
+                "user_input_fields": sorted(
+                    {f"inlet_{f}" for f in inlet_edge.user_input_fields}
+                    | {f"outlet_{f}" for f in outlet_edge.user_input_fields}
+                ),
+                "solved_fields": sorted(
+                    {f"inlet_{f}" for f in inlet_edge.solved_fields}
+                    | {f"outlet_{f}" for f in outlet_edge.solved_fields}
+                ),
+                "conflicting_fields": sorted(
+                    {f"inlet_{f}" for f in inlet_edge.conflicting_fields}
+                    | {f"outlet_{f}" for f in outlet_edge.conflicting_fields}
+                ),
                 "report": component.report,
-                "inlet_state": _state_to_dict(component.inlet_state),
-                "outlet_state": _state_to_dict(component.outlet_state),
+                "inlet_state": _state_to_dict(inlet_edge.state),
+                "outlet_state": _state_to_dict(outlet_edge.state),
             }
         )
     return rows

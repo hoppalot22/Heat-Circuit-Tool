@@ -5,9 +5,31 @@ from itertools import combinations
 from math import isclose, log10, pi
 from typing import Optional
 
-from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
+from .model import Circuit, Component, ComponentKind, Edge, ProcessKind, ThermoSpec
 from .thermo import StateSpec, SteamPropertyBackend, ThermoState
 from .units import almost_equal
+
+_PIPE_ONLY_FIELDS = {
+    "heat_duty_kw",
+    "pressure_drop_mpa",
+    "mass_flow_kg_s",
+    "pipe_length_m",
+    "pipe_outer_diameter_m",
+    "pipe_wall_thickness_m",
+    "pipe_roughness_m",
+    "elevation_change_m",
+    "local_loss_coefficient",
+}
+
+
+def _scoped_user_fields(circuit: Circuit, component: Component) -> set[str]:
+    """Rebuild the legacy prefixed field-name view ("inlet_x"/"outlet_x") from edges."""
+    inlet_edge = circuit.inlet_edge(component)
+    outlet_edge = circuit.outlet_edge(component)
+    fields: set[str] = {f"inlet_{name}" for name in inlet_edge.user_input_fields}
+    for name in outlet_edge.user_input_fields:
+        fields.add(name if name in _PIPE_ONLY_FIELDS else f"outlet_{name}")
+    return fields
 
 
 @dataclass(slots=True)
@@ -129,6 +151,10 @@ class ThermoSolver:
 
         for component in circuit.components.values():
             component.reset_results()
+        for edge in circuit.edges.values():
+            edge.state = None
+            edge.solved_fields.clear()
+            edge.conflicting_fields.clear()
 
         solution = CircuitSolution()
         order = circuit.traversal_order(circuit.start_component_id)
@@ -143,14 +169,16 @@ class ThermoSolver:
                 outlet_state_hint = self._resolve_outlet_state(circuit, component)
                 if inlet_state is None and outlet_state_hint is None:
                     continue
-                previous_inlet = component.inlet_state
-                previous_outlet = component.outlet_state
-                result = self.solve_component(component, inlet_state, outlet_state_hint)
-                component.inlet_state = result.inlet_state
-                component.outlet_state = result.outlet_state
+                inlet_edge = circuit.inlet_edge(component)
+                outlet_edge = circuit.outlet_edge(component)
+                previous_inlet = inlet_edge.state
+                previous_outlet = outlet_edge.state
+                result = self.solve_component(circuit, component, inlet_state, outlet_state_hint)
+                inlet_edge.state = result.inlet_state
+                outlet_edge.state = result.outlet_state
                 component.report = result.message
                 results_by_id[component.component_id] = result
-                if self._state_changed(previous_inlet, component.inlet_state) or self._state_changed(previous_outlet, component.outlet_state):
+                if self._state_changed(previous_inlet, inlet_edge.state) or self._state_changed(previous_outlet, outlet_edge.state):
                     changed = True
             if not changed:
                 break
@@ -163,8 +191,8 @@ class ThermoSolver:
                     component_name=component.name,
                     kind=component.kind,
                     process_kind=component.process_kind,
-                    inlet_state=component.inlet_state,
-                    outlet_state=component.outlet_state,
+                    inlet_state=circuit.inlet_edge(component).state,
+                    outlet_state=circuit.outlet_edge(component).state,
                     status="Undeterminable",
                     message="No solvable inlet state could be resolved from upstream links.",
                 )
@@ -178,14 +206,17 @@ class ThermoSolver:
         return solution
 
     def _resolve_inlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
-        user_inlet = self._state_from_thermo_spec(component.inlet_spec)
+        inlet_edge = circuit.inlet_edge(component)
+        user_inlet = self._state_from_thermo_spec(inlet_edge.spec)
         if user_inlet is not None:
             return user_inlet
         upstream_states: list[ThermoState] = []
         for upstream_id in circuit.incoming(component.component_id):
             upstream = circuit.components.get(upstream_id)
-            if upstream and upstream.outlet_state is not None:
-                upstream_states.append(upstream.outlet_state)
+            if upstream is not None:
+                upstream_outlet_state = circuit.outlet_edge(upstream).state
+                if upstream_outlet_state is not None:
+                    upstream_states.append(upstream_outlet_state)
         if not upstream_states:
             if component.component_id == circuit.start_component_id and circuit.seed_state is not None:
                 return circuit.seed_state
@@ -195,14 +226,17 @@ class ThermoSolver:
         return self._mix_states(upstream_states)
 
     def _resolve_outlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
-        user_outlet = self._state_from_thermo_spec(component.outlet_spec)
+        outlet_edge = circuit.outlet_edge(component)
+        user_outlet = self._state_from_thermo_spec(outlet_edge.spec)
         if user_outlet is not None:
             return user_outlet
         downstream_states: list[ThermoState] = []
         for downstream_id in circuit.outgoing(component.component_id):
             downstream = circuit.components.get(downstream_id)
-            if downstream and downstream.inlet_state is not None:
-                downstream_states.append(downstream.inlet_state)
+            if downstream is not None:
+                downstream_inlet_state = circuit.inlet_edge(downstream).state
+                if downstream_inlet_state is not None:
+                    downstream_states.append(downstream_inlet_state)
         if not downstream_states:
             return None
         if len(downstream_states) == 1:
@@ -290,15 +324,17 @@ class ThermoSolver:
         returning_states: list[ThermoState] = []
         for upstream_id in circuit.incoming(circuit.start_component_id):
             upstream = circuit.components.get(upstream_id)
-            if upstream and upstream.outlet_state is not None:
-                returning_states.append(upstream.outlet_state)
+            if upstream is not None:
+                upstream_outlet_state = circuit.outlet_edge(upstream).state
+                if upstream_outlet_state is not None:
+                    returning_states.append(upstream_outlet_state)
         if not returning_states:
             return
         loop_return = self._mix_states(returning_states)
         reference_state = None
         start_component = circuit.components.get(circuit.start_component_id)
-        if start_component is not None and start_component.inlet_state is not None:
-            reference_state = start_component.inlet_state
+        if start_component is not None and circuit.inlet_edge(start_component).state is not None:
+            reference_state = circuit.inlet_edge(start_component).state
         elif circuit.seed_state is not None:
             reference_state = circuit.seed_state
         else:
@@ -337,13 +373,16 @@ class ThermoSolver:
 
     def solve_component(
         self,
+        circuit: Circuit,
         component: Component,
         inlet_state: ThermoState | None,
         outlet_state_hint: ThermoState | None,
     ) -> ComponentResult:
         process = component.process_kind
-        outlet_spec = component.outlet_spec
-        inlet_spec = component.inlet_spec
+        inlet_edge = circuit.inlet_edge(component)
+        outlet_edge = circuit.outlet_edge(component)
+        outlet_spec = outlet_edge.spec
+        inlet_spec = inlet_edge.spec
         outlet_state: Optional[ThermoState] = None
         solved_inlet: Optional[ThermoState] = inlet_state
         work = 0.0
@@ -355,19 +394,21 @@ class ThermoSolver:
             raise SolverError(f"Unable to solve component {component.name}: no inlet or outlet state available.")
 
         if inlet_state is None and outlet_state_hint is not None:
-            solved_inlet, outlet_state, work, heat, reverse_note = self._solve_component_reverse(component, outlet_state_hint)
+            solved_inlet, outlet_state, work, heat, reverse_note = self._solve_component_reverse(
+                component, inlet_spec, outlet_spec, outlet_state_hint
+            )
             notes.append(reverse_note)
         elif inlet_state is not None:
             solved_inlet = inlet_state
 
         if outlet_state is None and solved_inlet is not None:
             if component.kind == ComponentKind.PIPE:
-                outlet_state, pipe_note = self._solve_pipe_component(component, solved_inlet)
+                outlet_state, pipe_note = self._solve_pipe_component(component, solved_inlet, outlet_spec)
                 notes.append(pipe_note)
             elif component.kind in {ComponentKind.MIXER, ComponentKind.SPLITTER}:
-                outlet_state = self._solve_pass_through_component(component, solved_inlet)
+                outlet_state = self._solve_pass_through_component(component, solved_inlet, outlet_spec)
             elif process == ProcessKind.ISENTROPIC:
-                outlet_state, work, heat = self._solve_isentropic_component(component, solved_inlet)
+                outlet_state, work, heat = self._solve_isentropic_component(component, solved_inlet, inlet_spec, outlet_spec)
             elif process == ProcessKind.ISENTHALPIC:
                 outlet_state = self._solve_isenthalpic_component(component, solved_inlet, outlet_spec)
             elif process == ProcessKind.ISOBARIC:
@@ -377,7 +418,7 @@ class ThermoSolver:
                 outlet_state = self._solve_isochoric_component(component, solved_inlet, outlet_spec)
                 heat = outlet_state.enthalpy_kj_kg - solved_inlet.enthalpy_kj_kg
             elif process == ProcessKind.ADIABATIC:
-                outlet_state = self._solve_adiabatic_component(component, solved_inlet, outlet_spec)
+                outlet_state = self._solve_adiabatic_component(component, solved_inlet, inlet_spec, outlet_spec)
             elif process == ProcessKind.GENERAL:
                 outlet_state = self._solve_general_component(outlet_spec)
                 heat = outlet_state.enthalpy_kj_kg - solved_inlet.enthalpy_kj_kg
@@ -404,8 +445,8 @@ class ThermoSolver:
         if overdefined_endpoints:
             notes.append("Both inlet and outlet states are user-defined for a non-General process.")
 
-        status, message = self._constraint_report(component, solved_inlet, outlet_state)
-        conflicts = self._fixed_constraint_conflicts(component, solved_inlet, outlet_state)
+        status, message = self._constraint_report(component, inlet_edge, outlet_edge, solved_inlet, outlet_state)
+        conflicts = self._fixed_constraint_conflicts(inlet_edge, outlet_edge, solved_inlet, outlet_state)
         if conflicts:
             status = "Overconstrained"
             message = "User-entered fixed constraints conflict with solved state."
@@ -447,7 +488,7 @@ class ThermoSolver:
             ComponentKind.TURBINE,
             ComponentKind.PUMP,
         }:
-            inlet_state = self._reverse_isentropic_machine(component, outlet_state)
+            inlet_state = self._reverse_isentropic_machine(component, inlet_spec, outlet_spec, outlet_state)
             work = inlet_state.enthalpy_kj_kg - outlet_state.enthalpy_kj_kg if component.kind == ComponentKind.TURBINE else outlet_state.enthalpy_kj_kg - inlet_state.enthalpy_kj_kg
             return inlet_state, outlet_state, work, 0.0, "Solved from outlet state (reverse isentropic machine)."
         raise SolverError(
@@ -455,21 +496,25 @@ class ThermoSolver:
             "Provide inlet definition or additional process constraints."
         )
 
-    def _reverse_isenthalpic_component(self, component: Component, outlet_state: ThermoState) -> ThermoState:
-        inlet_pressure = component.inlet_spec.pressure_mpa
+    def _reverse_isenthalpic_component(
+        self, component: Component, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec, outlet_state: ThermoState
+    ) -> ThermoState:
+        inlet_pressure = inlet_spec.pressure_mpa
         if inlet_pressure is None:
-            if component.outlet_spec.pressure_drop_mpa is not None:
-                inlet_pressure = outlet_state.pressure_mpa + component.outlet_spec.pressure_drop_mpa
+            if outlet_spec.pressure_drop_mpa is not None:
+                inlet_pressure = outlet_state.pressure_mpa + outlet_spec.pressure_drop_mpa
             else:
                 inlet_pressure = outlet_state.pressure_mpa
         return self.backend.state_from_pressure_enthalpy(inlet_pressure, outlet_state.enthalpy_kj_kg)
 
-    def _reverse_isentropic_machine(self, component: Component, outlet_state: ThermoState) -> ThermoState:
-        inlet_pressure = component.inlet_spec.pressure_mpa
+    def _reverse_isentropic_machine(
+        self, component: Component, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec, outlet_state: ThermoState
+    ) -> ThermoState:
+        inlet_pressure = inlet_spec.pressure_mpa
         if inlet_pressure is None:
             raise SolverError(f"{component.name} reverse solve needs inlet pressure.")
 
-        efficiency = component.outlet_spec.efficiency or component.inlet_spec.efficiency
+        efficiency = outlet_spec.efficiency or inlet_spec.efficiency
         if efficiency is None or efficiency <= 0.0 or efficiency > 1.0:
             raise SolverError(f"{component.name} reverse solve needs efficiency in (0,1].")
 
@@ -532,7 +577,8 @@ class ThermoSolver:
 
     def _fixed_constraint_conflicts(
         self,
-        component: Component,
+        inlet_edge: Edge,
+        outlet_edge: Edge,
         inlet_state: ThermoState,
         outlet_state: ThermoState,
     ) -> list[str]:
@@ -554,28 +600,26 @@ class ThermoSolver:
             "quality": "quality",
         }
         conflicts: list[str] = []
-        for field_name in sorted(component.user_input_fields):
-            if field_name.startswith("inlet_"):
-                suffix = field_name.replace("inlet_", "", 1)
-                if suffix not in mapping:
-                    continue
-                expected = getattr(component.inlet_spec, suffix)
-                actual = getattr(inlet_state, mapping[suffix])
-                if self._is_conflict(expected, actual, tolerances[suffix]):
-                    conflicts.append(field_name)
-            elif field_name.startswith("outlet_"):
-                suffix = field_name.replace("outlet_", "", 1)
-                if suffix not in mapping:
-                    continue
-                expected = getattr(component.outlet_spec, suffix)
-                actual = getattr(outlet_state, mapping[suffix])
-                if self._is_conflict(expected, actual, tolerances[suffix]):
-                    conflicts.append(field_name)
-            elif field_name == "pressure_drop_mpa":
-                expected = component.outlet_spec.pressure_drop_mpa
+        for suffix in sorted(inlet_edge.user_input_fields):
+            if suffix not in mapping:
+                continue
+            expected = getattr(inlet_edge.spec, suffix)
+            actual = getattr(inlet_state, mapping[suffix])
+            if self._is_conflict(expected, actual, tolerances[suffix]):
+                conflicts.append(f"inlet_{suffix}")
+        for suffix in sorted(outlet_edge.user_input_fields):
+            if suffix == "pressure_drop_mpa":
+                expected = outlet_edge.spec.pressure_drop_mpa
                 actual = max(0.0, inlet_state.pressure_mpa - outlet_state.pressure_mpa)
                 if self._is_conflict(expected, actual, tolerances["pressure_drop_mpa"]):
-                    conflicts.append(field_name)
+                    conflicts.append("pressure_drop_mpa")
+                continue
+            if suffix not in mapping:
+                continue
+            expected = getattr(outlet_edge.spec, suffix)
+            actual = getattr(outlet_state, mapping[suffix])
+            if self._is_conflict(expected, actual, tolerances[suffix]):
+                conflicts.append(f"outlet_{suffix}")
         return conflicts
 
     def _is_conflict(self, expected: float | None, actual: float | None, tolerance: float) -> bool:
@@ -585,8 +629,7 @@ class ThermoSolver:
             return True
         return not isclose(float(expected), float(actual), rel_tol=tolerance, abs_tol=tolerance)
 
-    def _solve_pipe_component(self, component: Component, inlet_state: ThermoState) -> tuple[ThermoState, str]:
-        spec = component.outlet_spec
+    def _solve_pipe_component(self, component: Component, inlet_state: ThermoState, spec: ThermoSpec) -> tuple[ThermoState, str]:
         mass_flow = spec.mass_flow_kg_s
         length_m = spec.pipe_length_m
         outer_diameter_m = spec.pipe_outer_diameter_m
@@ -640,21 +683,23 @@ class ThermoSolver:
         )
         return outlet_state, note
 
-    def _solve_pass_through_component(self, component: Component, inlet_state: ThermoState) -> ThermoState:
-        target_pressure = component.outlet_spec.pressure_mpa
-        pressure_drop = component.outlet_spec.pressure_drop_mpa
+    def _solve_pass_through_component(self, component: Component, inlet_state: ThermoState, outlet_spec: ThermoSpec) -> ThermoState:
+        target_pressure = outlet_spec.pressure_mpa
+        pressure_drop = outlet_spec.pressure_drop_mpa
         if target_pressure is None and pressure_drop is not None:
             target_pressure = inlet_state.pressure_mpa - pressure_drop
         if target_pressure is None or abs(target_pressure - inlet_state.pressure_mpa) < 1e-9:
             return inlet_state
         return self.backend.state_from_pressure_enthalpy(target_pressure, inlet_state.enthalpy_kj_kg)
 
-    def _solve_isentropic_component(self, component: Component, inlet_state: ThermoState) -> tuple[ThermoState, float, float]:
-        target_pressure = component.outlet_spec.pressure_mpa or component.inlet_spec.pressure_mpa or inlet_state.pressure_mpa
+    def _solve_isentropic_component(
+        self, component: Component, inlet_state: ThermoState, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec
+    ) -> tuple[ThermoState, float, float]:
+        target_pressure = outlet_spec.pressure_mpa or inlet_spec.pressure_mpa or inlet_state.pressure_mpa
         if target_pressure is None:
             raise SolverError(f"{component.name} needs an outlet pressure for an isentropic solve.")
 
-        efficiency = component.outlet_spec.efficiency or component.inlet_spec.efficiency or 1.0
+        efficiency = outlet_spec.efficiency or inlet_spec.efficiency or 1.0
         if efficiency <= 0.0 or efficiency > 1.0:
             raise SolverError(f"{component.name} has invalid efficiency {efficiency}.")
 
@@ -724,9 +769,11 @@ class ThermoSolver:
                 upper_error = error
         return candidate
 
-    def _solve_adiabatic_component(self, component: Component, inlet_state: ThermoState, outlet_spec: ThermoSpec) -> ThermoState:
+    def _solve_adiabatic_component(
+        self, component: Component, inlet_state: ThermoState, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec
+    ) -> ThermoState:
         if component.kind in {ComponentKind.TURBINE, ComponentKind.PUMP}:
-            return self._solve_isentropic_component(component, inlet_state)[0]
+            return self._solve_isentropic_component(component, inlet_state, inlet_spec, outlet_spec)[0]
         return self._solve_isenthalpic_component(component, inlet_state, outlet_spec)
 
     def _solve_general_component(self, outlet_spec: ThermoSpec) -> ThermoState:
@@ -735,16 +782,20 @@ class ThermoSolver:
             raise SolverError("General process requires a fully defined outlet state.")
         return self.backend.make_state(spec)
 
-    def _constraint_report(self, component: Component, inlet_state: ThermoState, outlet_state: ThermoState) -> tuple[str, str]:
-        outlet_defined = component.outlet_spec.defined_count()
+    def _constraint_report(
+        self, component: Component, inlet_edge: Edge, outlet_edge: Edge, inlet_state: ThermoState, outlet_state: ThermoState
+    ) -> tuple[str, str]:
+        inlet_spec = inlet_edge.spec
+        outlet_spec = outlet_edge.spec
+        outlet_defined = outlet_spec.defined_count()
         if component.kind in {ComponentKind.MIXER, ComponentKind.SPLITTER} and outlet_defined == 0:
             return "Solved", f"{component.name} passes through mixed state from graph connectivity."
         if component.kind == ComponentKind.PIPE:
             required = (
-                component.outlet_spec.mass_flow_kg_s,
-                component.outlet_spec.pipe_length_m,
-                component.outlet_spec.pipe_outer_diameter_m,
-                component.outlet_spec.pipe_wall_thickness_m,
+                outlet_spec.mass_flow_kg_s,
+                outlet_spec.pipe_length_m,
+                outlet_spec.pipe_outer_diameter_m,
+                outlet_spec.pipe_wall_thickness_m,
             )
             if any(value is None for value in required):
                 return "Underconstrained", f"{component.name} requires mass flow, length, OD, and wall thickness."
@@ -753,20 +804,20 @@ class ThermoSolver:
             return "Underconstrained", f"{component.name} needs at least one outlet target property."
 
         if component.kind == ComponentKind.TURBINE:
-            efficiency = component.outlet_spec.efficiency or component.inlet_spec.efficiency
+            efficiency = outlet_spec.efficiency or inlet_spec.efficiency
             if efficiency is None:
                 return "Underconstrained", f"{component.name} needs an efficiency to compute actual work."
         if component.kind == ComponentKind.PUMP:
-            efficiency = component.outlet_spec.efficiency or component.inlet_spec.efficiency
+            efficiency = outlet_spec.efficiency or inlet_spec.efficiency
             if efficiency is None:
                 return "Underconstrained", f"{component.name} needs an efficiency to compute actual work."
 
-        temp_is_user = "outlet_temperature_c" in component.user_input_fields
-        h_is_user = "outlet_enthalpy_kj_kg" in component.user_input_fields
-        if temp_is_user and h_is_user and component.outlet_spec.temperature_c is not None and component.outlet_spec.enthalpy_kj_kg is not None:
-            if not isclose(outlet_state.temperature_c, component.outlet_spec.temperature_c, abs_tol=1e-2):
+        temp_is_user = "temperature_c" in outlet_edge.user_input_fields
+        h_is_user = "enthalpy_kj_kg" in outlet_edge.user_input_fields
+        if temp_is_user and h_is_user and outlet_spec.temperature_c is not None and outlet_spec.enthalpy_kj_kg is not None:
+            if not isclose(outlet_state.temperature_c, outlet_spec.temperature_c, abs_tol=1e-2):
                 return "Overconstrained", f"{component.name} outlet temperature conflicts with other outlet targets."
-            if not isclose(outlet_state.enthalpy_kj_kg, component.outlet_spec.enthalpy_kj_kg, abs_tol=1e-2):
+            if not isclose(outlet_state.enthalpy_kj_kg, outlet_spec.enthalpy_kj_kg, abs_tol=1e-2):
                 return "Overconstrained", f"{component.name} outlet enthalpy conflicts with other outlet targets."
         return "Solved", f"{component.name} solved successfully."
 
@@ -797,8 +848,8 @@ def analyze_constraint_system(circuit: Circuit) -> ConstraintDiagnostics:
         changed = False
         for component in order:
             inlet_available = _diagnostic_inlet_available(circuit, component, outlet_available, start_id, has_seed)
-            missing_fields = _diagnostic_missing_fields(component, inlet_available)
-            is_over, _ = _diagnostic_overconstraint_flags(component)
+            missing_fields = _diagnostic_missing_fields(circuit, component, inlet_available)
+            is_over, _ = _diagnostic_overconstraint_flags(circuit, component)
             if inlet_available and not missing_fields and not is_over:
                 if component.component_id not in outlet_available:
                     outlet_available.add(component.component_id)
@@ -809,8 +860,8 @@ def analyze_constraint_system(circuit: Circuit) -> ConstraintDiagnostics:
     component_diags: list[ComponentConstraintDiagnostic] = []
     for component in order:
         inlet_available = _diagnostic_inlet_available(circuit, component, outlet_available, start_id, has_seed)
-        missing_fields = _diagnostic_missing_fields(component, inlet_available)
-        is_over, over_messages = _diagnostic_overconstraint_flags(component)
+        missing_fields = _diagnostic_missing_fields(circuit, component, inlet_available)
+        is_over, over_messages = _diagnostic_overconstraint_flags(circuit, component)
 
         if is_over:
             status = "Overconstrained"
@@ -876,11 +927,11 @@ def _diagnostic_inlet_available(
     return any(upstream_id in outlet_available for upstream_id in circuit.incoming(component.component_id))
 
 
-def _diagnostic_missing_fields(component: Component, inlet_available: bool) -> list[str]:
+def _diagnostic_missing_fields(circuit: Circuit, component: Component, inlet_available: bool) -> list[str]:
     if not inlet_available:
         return []
 
-    user = component.user_input_fields
+    user = _scoped_user_fields(circuit, component)
     process = component.process_kind
 
     if component.kind in {ComponentKind.MIXER, ComponentKind.SPLITTER}:
@@ -937,8 +988,8 @@ def _diagnostic_missing_fields(component: Component, inlet_available: bool) -> l
     return []
 
 
-def _diagnostic_overconstraint_flags(component: Component) -> tuple[bool, list[str]]:
-    user = component.user_input_fields
+def _diagnostic_overconstraint_flags(circuit: Circuit, component: Component) -> tuple[bool, list[str]]:
+    user = _scoped_user_fields(circuit, component)
     process = component.process_kind
     messages: list[str] = []
 

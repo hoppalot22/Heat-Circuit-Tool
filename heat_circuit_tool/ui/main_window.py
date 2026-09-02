@@ -65,24 +65,25 @@ class HeatCircuitApp(ttk.Frame):
         if component is None:
             return
         seed = self.circuit.seed_state
-        component.inlet_spec.pressure_mpa = seed.pressure_mpa
-        component.inlet_spec.temperature_c = seed.temperature_c
-        component.inlet_spec.enthalpy_kj_kg = seed.enthalpy_kj_kg
-        component.inlet_spec.entropy_kj_kgk = seed.entropy_kj_kgk
-        component.inlet_spec.specific_volume_m3_kg = seed.specific_volume_m3_kg
-        component.inlet_spec.quality = seed.quality
+        inlet_edge = self.circuit.inlet_edge(component)
+        inlet_edge.spec.pressure_mpa = seed.pressure_mpa
+        inlet_edge.spec.temperature_c = seed.temperature_c
+        inlet_edge.spec.enthalpy_kj_kg = seed.enthalpy_kj_kg
+        inlet_edge.spec.entropy_kj_kgk = seed.entropy_kj_kgk
+        inlet_edge.spec.specific_volume_m3_kg = seed.specific_volume_m3_kg
+        inlet_edge.spec.quality = seed.quality
 
         seeded_fields = {
-            "inlet_pressure_mpa",
-            "inlet_temperature_c",
-            "inlet_enthalpy_kj_kg",
-            "inlet_entropy_kj_kgk",
-            "inlet_specific_volume_m3_kg",
-            "inlet_quality",
+            "pressure_mpa",
+            "temperature_c",
+            "enthalpy_kj_kg",
+            "entropy_kj_kgk",
+            "specific_volume_m3_kg",
+            "quality",
         }
-        component.user_input_fields.update(seeded_fields)
+        inlet_edge.user_input_fields.update(seeded_fields)
         for field_name in seeded_fields:
-            component.unit_preferences.setdefault(field_name, default_unit(field_name))
+            component.unit_preferences.setdefault(f"inlet_{field_name}", default_unit(f"inlet_{field_name}"))
 
     def _derive_log_path(self, project_path: str | None) -> str:
         if not project_path:
@@ -362,9 +363,9 @@ class HeatCircuitApp(ttk.Frame):
             name=f"{kind.value} {index}",
             x=120 + (index % 4) * 220,
             y=120 + (index // 4) * 140,
-            outlet_spec=default_outlet_spec,
         )
         self.circuit.add_component(component)
+        self.circuit.outlet_edge(component).spec = default_outlet_spec
         self.canvas.redraw()
         self.canvas.select_component(component.component_id)
         self.status.set(f"Added {component.name}")
@@ -387,9 +388,9 @@ class HeatCircuitApp(ttk.Frame):
             x=120 + (index % 4) * 220,
             y=120 + (index // 4) * 140,
         )
-        apply_preset(component, preset_name)
-        component.name = f"{component.name} {index}"
         self.circuit.add_component(component)
+        apply_preset(self.circuit, component, preset_name)
+        component.name = f"{component.name} {index}"
         self.canvas.redraw()
         self.canvas.select_component(component.component_id)
         self.status.set(f"Added preset {preset_name}")
@@ -497,21 +498,22 @@ class HeatCircuitApp(ttk.Frame):
         ]
 
         for component in self.circuit.components.values():
-            user_fields = component.user_input_fields
+            inlet_edge = self.circuit.inlet_edge(component)
+            outlet_edge = self.circuit.outlet_edge(component)
             for field_name in inlet_fields:
-                scoped = f"inlet_{field_name}"
-                if scoped not in user_fields:
-                    setattr(component.inlet_spec, field_name, None)
+                if field_name not in inlet_edge.user_input_fields:
+                    setattr(inlet_edge.spec, field_name, None)
             for field_name in outlet_fields:
-                scoped = f"outlet_{field_name}"
-                if scoped not in user_fields and field_name not in user_fields:
-                    setattr(component.outlet_spec, field_name, None)
+                if field_name not in outlet_edge.user_input_fields:
+                    setattr(outlet_edge.spec, field_name, None)
 
-            component.inlet_state = None
-            component.outlet_state = None
+            inlet_edge.state = None
+            outlet_edge.state = None
             component.report = ""
-            component.solved_fields.clear()
-            component.conflicting_fields.clear()
+            inlet_edge.solved_fields.clear()
+            outlet_edge.solved_fields.clear()
+            inlet_edge.conflicting_fields.clear()
+            outlet_edge.conflicting_fields.clear()
             component.is_dirty = True
 
     def _on_inspector_apply(self) -> None:
@@ -541,14 +543,14 @@ class HeatCircuitApp(ttk.Frame):
             return
 
         try:
-            result = solver.solve_component(component, inlet_state, outlet_hint)
+            result = solver.solve_component(self.circuit, component, inlet_state, outlet_hint)
         except SolverError:
             return
         except Exception:
             return
 
-        component.inlet_state = result.inlet_state
-        component.outlet_state = result.outlet_state
+        self.circuit.inlet_edge(component).state = result.inlet_state
+        self.circuit.outlet_edge(component).state = result.outlet_state
         component.report = result.message
         self.inspector.apply_solution_to_component(
             result.component_id,
