@@ -6,6 +6,13 @@ This documentation set is designed for fast onboarding and day-2 maintenance wor
 
 - API reference: PYTHON_API_REFERENCE.md
 - Project overview and usage: ../README.md
+- Post-refactor roadmap: POST_REFACTOR_ROADMAP.md
+
+## Current focus
+
+The architecture work behind the edge-owned thermodynamic state refactor is
+complete. The active roadmap work is now centered on branch-capable UI flows,
+flow-balance diagnostics, and release-readiness documentation.
 
 ## Recommended Reading Order
 
