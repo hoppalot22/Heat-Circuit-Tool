@@ -185,24 +185,26 @@ class ComponentInspector(ttk.Frame):
 
             if field_name == "kind":
                 widget: tk.Widget = ttk.Combobox(self, textvariable=var, values=self._kind_values, state="readonly", width=22)
-                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._commit_field_change(f))
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name == "process_kind":
                 widget = ttk.Combobox(self, textvariable=var, values=self._process_values, state="readonly", width=22)
-                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._commit_field_change(f))
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name in {"inlet_definition_mode", "outlet_definition_mode"}:
                 widget = ttk.Combobox(self, textvariable=var, values=self._definition_modes, state="readonly", width=22)
-                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                widget.bind("<<ComboboxSelected>>", lambda _e, f=field_name: self._commit_field_change(f))
                 unit_widget = self._make_unit_placeholder(row)
             elif field_name == "notes":
                 widget = tk.Entry(self, textvariable=var, width=30, bg=self._neutral_bg, fg="#000000")
                 widget.bind("<KeyRelease>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                widget.bind("<FocusOut>", lambda _e, f=field_name: self._commit_field_change(f))
                 self._colorable_fields.add(field_name)
                 unit_widget = self._make_unit_placeholder(row)
             else:
                 widget = tk.Entry(self, textvariable=var, width=20, bg=self._neutral_bg, fg="#000000")
                 widget.bind("<KeyRelease>", lambda _e, f=field_name: self._on_any_field_modified(f))
+                widget.bind("<FocusOut>", lambda _e, f=field_name: self._commit_field_change(f))
                 self._colorable_fields.add(field_name)
                 unit_widget = self._make_unit_selector(row, field_name)
 
@@ -213,7 +215,7 @@ class ComponentInspector(ttk.Frame):
         self.columnconfigure(1, weight=1)
 
         button_row = len(self.field_specs) + 1  # +1 for the banner row
-        ttk.Button(self, text="Apply to Component", command=self.apply_to_component).grid(row=button_row, column=0, columnspan=3, sticky="ew", padx=4, pady=(10, 2))
+        ttk.Button(self, text="Clear User Fields", command=self.clear_user_fields).grid(row=button_row, column=0, columnspan=3, sticky="ew", padx=4, pady=(10, 2))
         ttk.Button(self, text="Solve Circuit", command=self.solve_requested).grid(row=button_row + 1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
 
     def update_constraint_status(self, diagnostic: ComponentConstraintDiagnostic | None) -> None:
@@ -323,6 +325,9 @@ class ComponentInspector(ttk.Frame):
         return None, field_name
 
     def load_component(self, component_id: Optional[str]) -> None:
+        previous_id = self.current_component_id
+        if previous_id is not None and previous_id != component_id and previous_id in self.circuit.components:
+            self.apply_to_component()
         self.current_component_id = component_id
         self._loading = True
         if component_id is None:
@@ -426,6 +431,25 @@ class ComponentInspector(ttk.Frame):
         self._apply_highlights(component)
         if self.on_apply:
             self.on_apply()
+
+    def clear_user_fields(self) -> None:
+        """Clear every user-defined thermodynamic field on this component's inlet/outlet edges."""
+        if self.current_component_id is None:
+            return
+        component = self.circuit.components[self.current_component_id]
+        inlet_edge = self.circuit.inlet_edge(component)
+        outlet_edge = self.circuit.outlet_edge(component)
+        edges = [inlet_edge] if inlet_edge is outlet_edge else [inlet_edge, outlet_edge]
+        for edge in edges:
+            for suffix in list(edge.user_input_fields):
+                setattr(edge.spec, suffix, None)
+            edge.user_input_fields.clear()
+            edge.solved_fields.clear()
+            edge.conflicting_fields.clear()
+        component.is_dirty = True
+        self.load_component(self.current_component_id)
+        if self.on_dirty:
+            self.on_dirty()
 
     def apply_solution_to_component(
         self,
@@ -584,6 +608,13 @@ class ComponentInspector(ttk.Frame):
             else:
                 edge.user_input_fields.discard(suffix)
         self._clear_highlights_dirty(component)
+
+    def _commit_field_change(self, field_name: str) -> None:
+        """Commit the edited field (and every other pending edit) to the model immediately."""
+        if self._loading or self.current_component_id is None:
+            return
+        self._on_any_field_modified(field_name)
+        self.apply_to_component()
 
     def _on_any_field_modified(self, field_name: str) -> None:
         if self._loading or self.current_component_id is None:

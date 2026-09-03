@@ -358,6 +358,37 @@ class ConstraintSystemTests(unittest.TestCase):
 
         self.assertEqual(order, ["A", "B", "C", "D"])
 
+    def test_isothermal_process_solves_and_conserves_temperature(self) -> None:
+        circuit = Circuit(seed_state=make_seed_state())
+        comp = make_component(
+            circuit,
+            "HX1",
+            name="Isothermal Heat Exchanger",
+            kind=ComponentKind.HEAT_EXCHANGER,
+            process_kind=ProcessKind.ISOTHERMAL,
+            outlet_spec=ThermoSpec(pressure_mpa=0.5),
+            user_input_fields={"outlet_pressure_mpa"},
+        )
+        solver = ThermoSolver()
+        results = solver.propagate(circuit)
+        self.assertEqual(results[comp.component_id].status, "Solved")
+        self.assertAlmostEqual(results[comp.component_id].inlet_state.temperature_c, 100.0)
+        self.assertAlmostEqual(results[comp.component_id].outlet_state.temperature_c, 100.0)
+        self.assertAlmostEqual(results[comp.component_id].outlet_state.pressure_mpa, 0.5)
+
+    def test_isothermal_process_diagnostics(self) -> None:
+        circuit = Circuit(seed_state=make_seed_state())
+        make_component(
+            circuit,
+            "HX1",
+            name="Isothermal Heat Exchanger",
+            kind=ComponentKind.HEAT_EXCHANGER,
+            process_kind=ProcessKind.ISOTHERMAL,
+        )
+        diag = analyze_constraint_system(circuit)
+        self.assertEqual(diag.system_status, "Underconstrained")
+        self.assertIn("Isothermal Heat Exchanger", diag.underconstrained_components)
+
     def test_traversal_order_ignores_cycles_without_repeating_components(self) -> None:
         circuit = Circuit()
         for component_id in ("A", "B", "C"):

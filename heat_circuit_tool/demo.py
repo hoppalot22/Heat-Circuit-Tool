@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 from .model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
 from .solver import SteamPropertyBackend, solve_circuit
+
+_THERMO_FIELDS = [f.name for f in fields(ThermoSpec)]
 
 
 def _set_specs(circuit: Circuit, component: Component, *, inlet_spec: ThermoSpec | None = None, outlet_spec: ThermoSpec | None = None) -> None:
     if inlet_spec is not None:
-        circuit.inlet_edge(component).spec = inlet_spec
+        inlet_edge = circuit.inlet_edge(component)
+        inlet_edge.spec = inlet_spec
+        for f in _THERMO_FIELDS:
+            if getattr(inlet_spec, f) is not None:
+                inlet_edge.user_input_fields.add(f)
     if outlet_spec is not None:
-        circuit.outlet_edge(component).spec = outlet_spec
+        outlet_edge = circuit.outlet_edge(component)
+        outlet_edge.spec = outlet_spec
+        for f in _THERMO_FIELDS:
+            if getattr(outlet_spec, f) is not None:
+                outlet_edge.user_input_fields.add(f)
 
 
 def build_reheat_rankine_demo() -> Circuit:

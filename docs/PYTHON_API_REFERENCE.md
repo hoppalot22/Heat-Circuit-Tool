@@ -304,6 +304,7 @@ Methods
 - _solve_isenthalpic_component(self, component, inlet_state, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
 - _solve_isobaric_component(self, component, inlet_state, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
 - _solve_isochoric_component(self, component, inlet_state, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
+- _solve_isothermal_component(self, component, inlet_state, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
 - _solve_adiabatic_component(self, component, inlet_state, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
 - _solve_general_component(self, outlet_spec): Solves or evaluates thermodynamic/process state based on available constraints.
 - _constraint_report(self, component, inlet_state, outlet_state): Internal helper used to keep public workflows modular and testable.

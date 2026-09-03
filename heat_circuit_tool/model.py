@@ -28,6 +28,7 @@ class ProcessKind(str, Enum):
     ISENTROPIC = "Isentropic"
     ISENTHALPIC = "Isenthalpic"
     ADIABATIC = "Adiabatic"
+    ISOTHERMAL = "Isothermal"
 
 
 class PortRole(str, Enum):

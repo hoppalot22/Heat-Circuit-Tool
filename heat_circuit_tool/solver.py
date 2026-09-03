@@ -19,6 +19,7 @@ _CONSERVED_FIELD_BY_PROCESS = {
     ProcessKind.ISOBARIC: "pressure_mpa",
     ProcessKind.ISOCHORIC: "specific_volume_m3_kg",
     ProcessKind.ISENTHALPIC: "enthalpy_kj_kg",
+    ProcessKind.ISOTHERMAL: "temperature_c",
 }
 _CONSERVATION_EXCLUDED_KINDS = {ComponentKind.PIPE, ComponentKind.MIXER, ComponentKind.SPLITTER}
 
@@ -520,6 +521,9 @@ class ThermoSolver:
             elif process == ProcessKind.ISOCHORIC:
                 outlet_state = self._solve_isochoric_component(component, solved_inlet, outlet_spec)
                 heat = outlet_state.enthalpy_kj_kg - solved_inlet.enthalpy_kj_kg
+            elif process == ProcessKind.ISOTHERMAL:
+                outlet_state = self._solve_isothermal_component(component, solved_inlet, outlet_spec)
+                heat = outlet_state.enthalpy_kj_kg - solved_inlet.enthalpy_kj_kg
             elif process == ProcessKind.ADIABATIC:
                 outlet_state = self._solve_adiabatic_component(component, solved_inlet, inlet_spec, outlet_spec)
             elif process == ProcessKind.GENERAL:
@@ -605,11 +609,12 @@ class ThermoSolver:
         self, component: Component, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec, outlet_state: ThermoState
     ) -> ThermoState:
         inlet_pressure = inlet_spec.pressure_mpa
+        if inlet_pressure is None and outlet_spec.pressure_drop_mpa is not None:
+            inlet_pressure = outlet_state.pressure_mpa + outlet_spec.pressure_drop_mpa
         if inlet_pressure is None:
-            if outlet_spec.pressure_drop_mpa is not None:
-                inlet_pressure = outlet_state.pressure_mpa + outlet_spec.pressure_drop_mpa
-            else:
-                inlet_pressure = outlet_state.pressure_mpa
+            raise SolverError(
+                f"{component.name} needs an inlet pressure or pressure drop to reverse-solve an isenthalpic/adiabatic process."
+            )
         return self.backend.state_from_pressure_enthalpy(inlet_pressure, outlet_state.enthalpy_kj_kg)
 
     def _reverse_isentropic_machine(
@@ -619,62 +624,73 @@ class ThermoSolver:
         if inlet_pressure is None:
             raise SolverError(f"{component.name} reverse solve needs inlet pressure.")
 
-        efficiency = outlet_spec.efficiency or inlet_spec.efficiency
-        if efficiency is None or efficiency <= 0.0 or efficiency > 1.0:
-            raise SolverError(f"{component.name} reverse solve needs efficiency in (0,1].")
+        efficiency = outlet_spec.efficiency or inlet_spec.efficiency or 1.0
+        if efficiency <= 0.0 or efficiency > 1.0:
+            raise SolverError(f"{component.name} has invalid efficiency {efficiency}.")
 
         pout = outlet_state.pressure_mpa
         hout = outlet_state.enthalpy_kj_kg
 
-        def residual(h_in: float) -> float:
-            inlet_state = self.backend.state_from_pressure_enthalpy(inlet_pressure, h_in)
-            ideal_out = self.backend.state_from_pressure_entropy(pout, inlet_state.entropy_kj_kgk)
+        def residual(h_in: float) -> Optional[float]:
+            try:
+                inlet_state = self.backend.state_from_pressure_enthalpy(inlet_pressure, h_in)
+                ideal_out = self.backend.state_from_pressure_entropy(pout, inlet_state.entropy_kj_kgk)
+            except Exception:
+                return None
             if component.kind == ComponentKind.TURBINE:
                 predicted = h_in - efficiency * (h_in - ideal_out.enthalpy_kj_kg)
             else:
                 predicted = h_in + (ideal_out.enthalpy_kj_kg - h_in) / efficiency
             return predicted - hout
 
-        lo = hout - 2500.0
-        hi = hout + 2500.0
-        f_lo = residual(lo)
-        f_hi = residual(hi)
-        if f_lo == 0.0:
-            return self.backend.state_from_pressure_enthalpy(inlet_pressure, lo)
-        if f_hi == 0.0:
-            return self.backend.state_from_pressure_enthalpy(inlet_pressure, hi)
-        if f_lo * f_hi > 0.0:
-            steps = 80
-            prev_h = lo
-            prev_f = f_lo
-            found = False
-            for idx in range(1, steps + 1):
-                h = lo + (hi - lo) * idx / steps
+        # Pumps typically shift enthalpy by only a few kJ/kg while turbines can
+        # drop it by thousands, so scan outward from hout in expanding steps
+        # rather than jumping straight to a wide fixed window. Any offset whose
+        # enthalpy falls outside the property backend's valid domain (e.g. deep
+        # negative/subcooled enthalpies) is simply skipped instead of crashing.
+        offsets = [0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 1500, 2000, 2500]
+        samples: list[tuple[float, float]] = []
+        center_f = residual(hout)
+        if center_f is not None:
+            samples.append((hout, center_f))
+        for offset in offsets:
+            for h in (hout - offset, hout + offset):
                 f = residual(h)
-                if prev_f == 0.0:
-                    return self.backend.state_from_pressure_enthalpy(inlet_pressure, prev_h)
-                if f == 0.0:
-                    return self.backend.state_from_pressure_enthalpy(inlet_pressure, h)
-                if prev_f * f < 0.0:
-                    lo, hi = prev_h, h
-                    f_lo, f_hi = prev_f, f
-                    found = True
-                    break
-                prev_h, prev_f = h, f
-            if not found:
-                raise SolverError(f"{component.name} reverse solve could not bracket a valid inlet state.")
+                if f is not None:
+                    samples.append((h, f))
+        samples.sort(key=lambda item: item[0])
+        if not samples:
+            raise SolverError(f"{component.name} reverse solve could not evaluate any valid inlet state near the outlet.")
 
+        bracket: tuple[float, float, float, float] | None = None
+        for (h_lo, f_lo), (h_hi, f_hi) in zip(samples, samples[1:]):
+            if f_lo == 0.0:
+                return self.backend.state_from_pressure_enthalpy(inlet_pressure, h_lo)
+            if f_hi == 0.0:
+                return self.backend.state_from_pressure_enthalpy(inlet_pressure, h_hi)
+            if f_lo * f_hi < 0.0:
+                bracket = (h_lo, f_lo, h_hi, f_hi)
+                break
+        if bracket is None:
+            raise SolverError(f"{component.name} reverse solve could not bracket a valid inlet state.")
+
+        lo, f_lo, hi, f_hi = bracket
         for _ in range(80):
             mid = 0.5 * (lo + hi)
             f_mid = residual(mid)
+            if f_mid is None:
+                # Backend rejected the midpoint; step slightly toward the
+                # narrower side of the bracket and try again once.
+                mid = 0.5 * (lo + mid)
+                f_mid = residual(mid)
+                if f_mid is None:
+                    break
             if abs(f_mid) < 1e-6:
                 return self.backend.state_from_pressure_enthalpy(inlet_pressure, mid)
             if f_lo * f_mid <= 0.0:
-                hi = mid
-                f_hi = f_mid
+                hi, f_hi = mid, f_mid
             else:
-                lo = mid
-                f_lo = f_mid
+                lo, f_lo = mid, f_mid
         return self.backend.state_from_pressure_enthalpy(inlet_pressure, 0.5 * (lo + hi))
 
     def _has_state_definition(self, spec: ThermoSpec) -> bool:
@@ -822,9 +838,11 @@ class ThermoSolver:
         return actual, 0.0, 0.0
 
     def _solve_isenthalpic_component(self, component: Component, inlet_state: ThermoState, outlet_spec: ThermoSpec) -> ThermoState:
-        target_pressure = outlet_spec.pressure_mpa or inlet_state.pressure_mpa
+        target_pressure = outlet_spec.pressure_mpa
+        if target_pressure is None and outlet_spec.pressure_drop_mpa is not None:
+            target_pressure = inlet_state.pressure_mpa - outlet_spec.pressure_drop_mpa
         if target_pressure is None:
-            raise SolverError(f"{component.name} needs an outlet pressure for an isenthalpic solve.")
+            raise SolverError(f"{component.name} needs an outlet pressure or pressure drop for an isenthalpic/adiabatic solve.")
         return self.backend.state_from_pressure_enthalpy(target_pressure, inlet_state.enthalpy_kj_kg)
 
     def _solve_isobaric_component(self, component: Component, inlet_state: ThermoState, outlet_spec: ThermoSpec) -> ThermoState:
@@ -874,6 +892,26 @@ class ThermoSolver:
                 upper_error = error
         return candidate
 
+    def _solve_isothermal_component(
+        self, component: Component, inlet_state: ThermoState, outlet_spec: ThermoSpec
+    ) -> ThermoState:
+        target_temperature = outlet_spec.temperature_c or inlet_state.temperature_c
+        if target_temperature is None:
+            raise SolverError(f"{component.name} needs a temperature for an isothermal solve.")
+        spec = outlet_spec.to_state_spec()
+        spec.temperature_c = target_temperature
+        if spec.pressure_mpa is None and outlet_spec.pressure_drop_mpa is not None:
+            spec.pressure_mpa = inlet_state.pressure_mpa - outlet_spec.pressure_drop_mpa
+        if (
+            spec.pressure_mpa is None
+            and spec.enthalpy_kj_kg is None
+            and spec.entropy_kj_kgk is None
+            and spec.quality is None
+            and spec.specific_volume_m3_kg is None
+        ):
+            raise SolverError(f"{component.name} is underconstrained: add outlet P, h, s, x, or v.")
+        return self.backend.make_state(spec)
+
     def _solve_adiabatic_component(
         self, component: Component, inlet_state: ThermoState, inlet_spec: ThermoSpec, outlet_spec: ThermoSpec
     ) -> ThermoState:
@@ -905,7 +943,7 @@ class ThermoSolver:
             if any(value is None for value in required):
                 return "Underconstrained", f"{component.name} requires mass flow, length, OD, and wall thickness."
             return "Solved", f"{component.name} solved with hydraulic pressure-loss model."
-        if outlet_defined == 0 and component.process_kind in {ProcessKind.ISOBARIC, ProcessKind.ISOCHORIC, ProcessKind.GENERAL}:
+        if outlet_defined == 0 and component.process_kind in {ProcessKind.ISOBARIC, ProcessKind.ISOCHORIC, ProcessKind.ISOTHERMAL, ProcessKind.GENERAL}:
             return "Underconstrained", f"{component.name} needs at least one outlet target property."
 
         if component.kind == ComponentKind.TURBINE:
@@ -960,6 +998,17 @@ def analyze_constraint_system(circuit: Circuit) -> ConstraintDiagnostics:
                     outlet_available.add(component.component_id)
                     changed = True
 
+    # The forward/backward-only heuristics above can't see reverse-solved
+    # components (e.g. a pump whose inlet state is derived from its outlet
+    # target plus a downstream-shared pressure). Run the real propagation pass
+    # so any component it actually resolves is reported as Well-defined rather
+    # than Blocked/Underconstrained, keeping this diagnostic consistent with
+    # what the solver display shows.
+    try:
+        solved_results = ThermoSolver().propagate(circuit)
+    except Exception:
+        solved_results = {}
+
     total_missing = 0
     frontier_missing_counts: list[int] = []
     component_diags: list[ComponentConstraintDiagnostic] = []
@@ -967,6 +1016,13 @@ def analyze_constraint_system(circuit: Circuit) -> ConstraintDiagnostics:
         inlet_available = _diagnostic_inlet_available(circuit, component, outlet_available, start_id, has_seed)
         missing_fields = _diagnostic_missing_fields(circuit, component, inlet_available)
         is_over, over_messages = _diagnostic_overconstraint_flags(circuit, component)
+        resolved_result = solved_results.get(component.component_id)
+        fully_resolved = (
+            resolved_result is not None
+            and resolved_result.status == "Solved"
+            and resolved_result.inlet_state is not None
+            and resolved_result.outlet_state is not None
+        )
 
         if is_over:
             status = "Overconstrained"
@@ -983,6 +1039,12 @@ def analyze_constraint_system(circuit: Circuit) -> ConstraintDiagnostics:
             diagnostics.underconstrained_components.append(component.name)
             pretty_missing = ", ".join(missing_fields) if missing_fields else "additional process inputs"
             message = f"Needs {len(missing_fields)} more input(s): {pretty_missing}."
+        elif fully_resolved:
+            # The forward-only heuristic can't see e.g. a pump reverse-solved from
+            # its outlet target plus a downstream-shared pressure; trust the real
+            # propagation result instead of reporting it as still Blocked.
+            status = "Well-defined"
+            message = "Sufficient user constraints are available (resolved via reverse state propagation)."
         else:
             status = "Blocked"
             diagnostics.blocked_components.append(component.name)
@@ -1062,6 +1124,20 @@ def _diagnostic_missing_fields(circuit: Circuit, component: Component, inlet_ava
             key in user for key in options
         ) else []
 
+    if process == ProcessKind.ISOTHERMAL:
+        options = [
+            "outlet_pressure_mpa",
+            "outlet_enthalpy_kj_kg",
+            "outlet_entropy_kj_kgk",
+            "outlet_quality",
+            "outlet_specific_volume_m3_kg",
+            "pressure_drop_mpa",
+            "outlet_pressure_drop_mpa",
+        ]
+        return ["one of: outlet_pressure / pressure_drop / outlet_enthalpy / outlet_entropy / outlet_quality / outlet_specific_volume"] if not any(
+            key in user for key in options
+        ) else []
+
     if process == ProcessKind.GENERAL:
         state_keys = [
             "outlet_pressure_mpa",
@@ -1087,6 +1163,12 @@ def _diagnostic_missing_fields(circuit: Circuit, component: Component, inlet_ava
         return missing
 
     if process == ProcessKind.ISOCHORIC:
+        if "outlet_pressure_mpa" not in user and "pressure_drop_mpa" not in user and "outlet_pressure_drop_mpa" not in user:
+            return ["outlet_pressure or pressure_drop"]
+
+    if process == ProcessKind.ISENTHALPIC or (
+        process == ProcessKind.ADIABATIC and component.kind not in {ComponentKind.TURBINE, ComponentKind.PUMP}
+    ):
         if "outlet_pressure_mpa" not in user and "pressure_drop_mpa" not in user and "outlet_pressure_drop_mpa" not in user:
             return ["outlet_pressure or pressure_drop"]
 
@@ -1131,6 +1213,8 @@ def _diagnostic_overconstraint_flags(circuit: Circuit, component: Component) -> 
 
     if process == ProcessKind.ISOBARIC and user_state_count > 2:
         messages.append("Too many outlet state targets for an isobaric component.")
+    if process == ProcessKind.ISOTHERMAL and user_state_count > 2:
+        messages.append("Too many outlet state targets for an isothermal component.")
     if process == ProcessKind.GENERAL and user_state_count > 2:
         messages.append("General process may be overconstrained with more than two outlet state targets.")
     if process == ProcessKind.ISENTROPIC and component.kind in {ComponentKind.TURBINE, ComponentKind.PUMP}:

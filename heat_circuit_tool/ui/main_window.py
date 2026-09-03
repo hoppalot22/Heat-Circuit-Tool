@@ -22,14 +22,14 @@ from ..unit_system import default_unit
 class HeatCircuitApp(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master)
-        self._root = master
-        self._root.title("Heat Circuit Tool")
-        screen_w = max(int(self._root.winfo_screenwidth()), 800)
-        screen_h = max(int(self._root.winfo_screenheight()), 600)
+        self._app_root = master
+        self._app_root.title("Heat Circuit Tool")
+        screen_w = max(int(self._app_root.winfo_screenwidth()), 800)
+        screen_h = max(int(self._app_root.winfo_screenheight()), 600)
         launch_w = max(screen_w // 2, 480)
         launch_h = max(screen_h // 2, 320)
-        self._root.geometry(f"{launch_w}x{launch_h}")
-        self._root.minsize(480, 320)
+        self._app_root.geometry(f"{launch_w}x{launch_h}")
+        self._app_root.minsize(480, 320)
         self.circuit = build_reheat_rankine_demo()
         self._selection_id: Optional[str] = None
         self._latest_solved_snapshot: dict | None = None
@@ -40,16 +40,12 @@ class HeatCircuitApp(ttk.Frame):
         self._constraint_diagnostics: ConstraintDiagnostics = ConstraintDiagnostics(system_status="Unknown")
         self._last_solver_error: str | None = None
         self._library_collapsed = False
-        self._inspector_collapsed = False
-        self._results_collapsed = False
         self._library_popout: tk.Toplevel | None = None
         self._inspector_popout: tk.Toplevel | None = None
         self._results_popout: tk.Toplevel | None = None
         self._popup_inspector: ComponentInspector | None = None
         self._popup_results_text: tk.Text | None = None
-        self._floating_panels: dict[str, dict] = {}
-        self._drag_state: dict[str, dict[str, int]] = {}
-        self._resize_state: dict[str, dict[str, int]] = {}
+        self._panel_state: dict[str, dict] = {}
         self._inspector_popup_host: ttk.Frame | None = None
         self._popup_results_scroll: ttk.Scrollbar | None = None
         self._active_wheel_target: str | None = None
@@ -97,7 +93,7 @@ class HeatCircuitApp(ttk.Frame):
         return str(project.with_name(base_name + ".solve_log.jsonl"))
 
     def _build_style(self) -> None:
-        style = ttk.Style(self._root)
+        style = ttk.Style(self._app_root)
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -136,6 +132,7 @@ class HeatCircuitApp(ttk.Frame):
         ttk.Button(toolbar, text="Revert Last Solve", command=self.revert_latest_solve).grid(row=0, column=7, padx=3)
         ttk.Button(toolbar, text="Save Project", command=self.save_project).grid(row=0, column=8, padx=3)
         ttk.Button(toolbar, text="Load Project", command=self.load_project).grid(row=0, column=9, padx=3)
+        ttk.Button(toolbar, text="Clear All User Fields", command=self.clear_all_user_fields).grid(row=0, column=10, padx=3)
 
         self.snapshot_var = tk.StringVar(value="")
         self.preset_var = tk.StringVar(value=preset_names()[0])
@@ -166,6 +163,15 @@ class HeatCircuitApp(ttk.Frame):
         self.content_pane = tk.PanedWindow(self.workspace, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=6, background="#0f1319")
         self.content_pane.grid(row=0, column=0, sticky="nsew")
 
+        # Docked side panel: Inspector and Results live as tabs of the same
+        # notebook, docked to the left of the canvas. Either tab can still be
+        # popped out into its own floating window via the "↗" button.
+        self.side_dock_frame = ttk.Frame(self.content_pane)
+        self.side_dock_frame.rowconfigure(0, weight=1)
+        self.side_dock_frame.columnconfigure(0, weight=1)
+        self.side_tabs = ttk.Notebook(self.side_dock_frame)
+        self.side_tabs.grid(row=0, column=0, sticky="nsew")
+
         self.canvas_frame = ttk.Frame(self.content_pane)
         self.canvas_frame.rowconfigure(0, weight=1)
         self.canvas_frame.columnconfigure(0, weight=1)
@@ -175,8 +181,7 @@ class HeatCircuitApp(ttk.Frame):
         # On macOS the physical Delete key sends BackSpace; bind both so it works on either platform.
         self.canvas.bind("<BackSpace>", self.delete_selected_component)
 
-        self.inspector_frame = tk.Frame(self.workspace, bg="#1a2230", highlightbackground="#344055", highlightthickness=1)
-        self.inspector_frame.grid_propagate(False)
+        self.inspector_frame = tk.Frame(self.side_tabs, bg="#1a2230")
         self.inspector_frame.columnconfigure(0, weight=1)
         self.inspector_frame.rowconfigure(1, weight=1)
         inspector_header = tk.Frame(self.inspector_frame, bg="#223047")
@@ -185,14 +190,11 @@ class HeatCircuitApp(ttk.Frame):
         inspector_title = tk.Label(inspector_header, text="Inspector", bg="#223047", fg="#e9eef7", font=("Segoe UI", 10, "bold"))
         inspector_title.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=4)
         self.inspector_popout_btn = ttk.Button(inspector_header, text="↗", width=2, style="PanelTool.TButton", command=self.toggle_inspector_popout)
-        self.inspector_popout_btn.grid(row=0, column=1, sticky="e", padx=(0, 2))
-        self.inspector_toggle_btn = ttk.Button(inspector_header, text="▴", width=2, style="PanelTool.TButton", command=self.toggle_inspector_panel)
-        self.inspector_toggle_btn.grid(row=0, column=2, sticky="e", padx=4)
+        self.inspector_popout_btn.grid(row=0, column=1, sticky="e", padx=4)
         self.inspector_content = ttk.Frame(self.inspector_frame, style="PanelBody.TFrame")
         self.inspector_content.grid(row=1, column=0, sticky="nsew")
 
-        self.results_frame = tk.Frame(self.workspace, bg="#1a2230", highlightbackground="#344055", highlightthickness=1)
-        self.results_frame.grid_propagate(False)
+        self.results_frame = tk.Frame(self.side_tabs, bg="#1a2230")
         self.results_frame.columnconfigure(0, weight=1)
         self.results_frame.rowconfigure(1, weight=1)
         results_header = tk.Frame(self.results_frame, bg="#223047")
@@ -201,11 +203,12 @@ class HeatCircuitApp(ttk.Frame):
         results_title = tk.Label(results_header, text="Results", bg="#223047", fg="#e9eef7", font=("Segoe UI", 10, "bold"))
         results_title.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=4)
         self.results_popout_btn = ttk.Button(results_header, text="↗", width=2, style="PanelTool.TButton", command=self.toggle_results_popout)
-        self.results_popout_btn.grid(row=0, column=1, sticky="e", padx=(0, 2))
-        self.results_toggle_btn = ttk.Button(results_header, text="▴", width=2, style="PanelTool.TButton", command=self.toggle_results_panel)
-        self.results_toggle_btn.grid(row=0, column=2, sticky="e", padx=4)
+        self.results_popout_btn.grid(row=0, column=1, sticky="e", padx=4)
         self.results_content = ttk.Frame(self.results_frame, style="PanelBody.TFrame")
         self.results_content.grid(row=1, column=0, sticky="nsew")
+
+        self.side_tabs.add(self.inspector_frame, text="Inspector")
+        self.side_tabs.add(self.results_frame, text="Results")
 
         self.inspector_scroll_canvas = tk.Canvas(self.inspector_content, background="#18202c", highlightthickness=0)
         self.inspector_scroll_canvas.pack(side="left", fill="both", expand=True)
@@ -234,47 +237,14 @@ class HeatCircuitApp(ttk.Frame):
         self.results_text.insert("1.0", "Load the demo and press Solve to validate the reheat Rankine cycle.")
         self.results_text.configure(state="disabled")
 
-        _resize_cursor = "size_nw_se" if platform.system() == "Windows" else "bottom_right_corner"
-        self.inspector_resize_handle = tk.Label(self.inspector_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor=_resize_cursor)
-        self.inspector_resize_handle.place(relx=1.0, rely=1.0, anchor="se")
-        self.results_resize_handle = tk.Label(self.results_frame, text="◢", bg="#1a2230", fg="#98a7bf", cursor=_resize_cursor)
-        self.results_resize_handle.place(relx=1.0, rely=1.0, anchor="se")
+        self.content_pane.add(self.side_dock_frame, minsize=320)
+        self.content_pane.add(self.canvas_frame, minsize=480)
 
-        self.content_pane.add(self.canvas_frame, minsize=720)
-
-        self._floating_panels = {
-            "inspector": {
-                "frame": self.inspector_frame,
-                "content": self.inspector_content,
-                "toggle_btn": self.inspector_toggle_btn,
-                "popout_btn": self.inspector_popout_btn,
-                "x": 950,
-                "y": 24,
-                "width": 430,
-                "expanded_height": 430,
-                "header_height": 30,
-                "collapsed": False,
-            },
-            "results": {
-                "frame": self.results_frame,
-                "content": self.results_content,
-                "toggle_btn": self.results_toggle_btn,
-                "popout_btn": self.results_popout_btn,
-                "x": 930,
-                "y": 470,
-                "width": 470,
-                "expanded_height": 290,
-                "header_height": 30,
-                "collapsed": False,
-            },
+        self._panel_state = {
+            "inspector": {"frame": self.inspector_frame, "popout_btn": self.inspector_popout_btn, "undocked": False},
+            "results": {"frame": self.results_frame, "popout_btn": self.results_popout_btn, "undocked": False},
         }
-        self._bind_drag("inspector", inspector_header, inspector_title)
-        self._bind_drag("results", results_header, results_title)
-        self._bind_resize("inspector", self.inspector_resize_handle)
-        self._bind_resize("results", self.results_resize_handle)
         self._bind_panel_scroll_events()
-        self._layout_floating_panels()
-        self.workspace.bind("<Configure>", self._on_workspace_resize)
 
         self.cycle_diagram = CycleDiagramPanel(self.diagram_tab)
         self.cycle_diagram.grid(row=0, column=0, sticky="nsew")
@@ -300,7 +270,7 @@ class HeatCircuitApp(ttk.Frame):
         self._update_live_diagnostics()
 
     def _build_insert_menu(self) -> None:
-        menu_bar = tk.Menu(self._root)
+        menu_bar = tk.Menu(self._app_root)
         insert_menu = tk.Menu(menu_bar, tearoff=0)
         insert_menu.add_command(label="Pump", command=lambda: self.add_component(ComponentKind.PUMP, ProcessKind.ISENTROPIC))
         insert_menu.add_command(label="Boiler", command=lambda: self.add_component(ComponentKind.BOILER, ProcessKind.ISOBARIC))
@@ -320,7 +290,7 @@ class HeatCircuitApp(ttk.Frame):
         insert_menu.add_cascade(label="Preset", menu=presets_menu)
 
         menu_bar.add_cascade(label="Insert", menu=insert_menu)
-        self._root.configure(menu=menu_bar)
+        self._app_root.configure(menu=menu_bar)
 
     def refresh_all(self) -> None:
         self.canvas.redraw()
@@ -361,12 +331,12 @@ class HeatCircuitApp(ttk.Frame):
                 local_loss_coefficient=1.0,
             )
         component = Component(
-            component_id=component_id,
-            kind=kind,
-            process_kind=process,
-            name=f"{kind.value} {index}",
-            x=120 + (index % 4) * 220,
-            y=120 + (index // 4) * 140,
+            component_id,
+            kind,
+            process,
+            f"{kind.value} {index}",
+            120 + (index % 4) * 220,
+            120 + (index // 4) * 140,
         )
         self.circuit.add_component(component)
         self.circuit.outlet_edge(component).spec = default_outlet_spec
@@ -388,12 +358,12 @@ class HeatCircuitApp(ttk.Frame):
             component_id = f"N{index}"
         base = PRESETS[preset_name]
         component = Component(
-            component_id=component_id,
-            kind=base.kind,
-            process_kind=base.process_kind,
-            name=f"{base.name} {index}",
-            x=120 + (index % 4) * 220,
-            y=120 + (index // 4) * 140,
+            component_id,
+            base.kind,
+            base.process_kind,
+            f"{base.name} {index}",
+            120 + (index % 4) * 220,
+            120 + (index // 4) * 140,
         )
         self.circuit.add_component(component)
         apply_preset(self.circuit, component, preset_name)
@@ -412,6 +382,30 @@ class HeatCircuitApp(ttk.Frame):
         if self._popup_inspector:
             self._popup_inspector.load_component(None)
         self.status.set("Component deleted")
+
+    def clear_all_user_fields(self) -> None:
+        if not messagebox.askyesno(
+            "Clear All User Fields",
+            "Clear every user-defined field from every component in the circuit?",
+        ):
+            return
+        for edge in self.circuit.edges.values():
+            for suffix in list(edge.user_input_fields):
+                setattr(edge.spec, suffix, None)
+            edge.user_input_fields.clear()
+            edge.solved_fields.clear()
+            edge.conflicting_fields.clear()
+        for component in self.circuit.components.values():
+            component.is_dirty = True
+        self.inspector.load_component(self._selection_id)
+        if self._popup_inspector:
+            self._popup_inspector.load_component(self._selection_id)
+        self._last_solution = None
+        self._last_solver_error = None
+        self._update_live_diagnostics()
+        self._refresh_results_text(None)
+        self.canvas.redraw()
+        self.status.set("Cleared all user-defined fields")
 
     def request_solve(self) -> None:
         if self._popup_inspector is not None:
@@ -824,115 +818,12 @@ class HeatCircuitApp(ttk.Frame):
         elif over_results:
             self.results_text.yview_scroll(1, "units")
 
-    def _bind_drag(self, key: str, header: tk.Widget, title: tk.Widget) -> None:
-        for widget in (header, title):
-            widget.bind("<ButtonPress-1>", lambda event, panel_key=key: self._start_panel_drag(panel_key, event))
-            widget.bind("<B1-Motion>", lambda event, panel_key=key: self._drag_panel(panel_key, event))
-
-    def _bind_resize(self, key: str, handle: tk.Widget) -> None:
-        handle.bind("<ButtonPress-1>", lambda event, panel_key=key: self._start_panel_resize(panel_key, event))
-        handle.bind("<B1-Motion>", lambda event, panel_key=key: self._resize_panel(panel_key, event))
-
-    def _start_panel_resize(self, key: str, event: tk.Event) -> None:
-        panel = self._floating_panels[key]
-        if panel.get("undocked"):
-            return
-        self._resize_state[key] = {
-            "start_x": event.x_root,
-            "start_y": event.y_root,
-            "start_w": panel["width"],
-            "start_h": panel["expanded_height"],
-        }
-
-    def _resize_panel(self, key: str, event: tk.Event) -> None:
-        panel = self._floating_panels[key]
-        if panel.get("undocked"):
-            return
-        state = self._resize_state.get(key)
-        if state is None:
-            return
-        new_w = state["start_w"] + (event.x_root - state["start_x"])
-        new_h = state["start_h"] + (event.y_root - state["start_y"])
-        panel["width"] = max(280, int(new_w))
-        panel["expanded_height"] = max(180, int(new_h))
-        self._layout_floating_panels()
-
-    def _layout_floating_panels(self) -> None:
-        for key in ("inspector", "results"):
-            panel = self._floating_panels[key]
-            if panel.get("undocked"):
-                panel["frame"].place_forget()
-                continue
-            height = panel["header_height"] if panel["collapsed"] else panel["expanded_height"]
-            panel["frame"].place(x=panel["x"], y=panel["y"], width=panel["width"], height=height)
-        self._clamp_floating_panels()
-
-    def _clamp_floating_panels(self) -> None:
-        max_w = max(self.workspace.winfo_width(), 500)
-        max_h = max(self.workspace.winfo_height(), 320)
-        for key in ("inspector", "results"):
-            panel = self._floating_panels[key]
-            if panel.get("undocked"):
-                continue
-            panel_h = panel["header_height"] if panel["collapsed"] else panel["expanded_height"]
-            panel["width"] = min(panel["width"], max_w)
-            panel["x"] = min(max(panel["x"], 0), max(0, max_w - panel["width"]))
-            panel["y"] = min(max(panel["y"], 0), max(0, max_h - panel_h))
-            panel["frame"].place_configure(x=panel["x"], y=panel["y"], width=panel["width"], height=panel_h)
-
-    def _start_panel_drag(self, key: str, event: tk.Event) -> None:
-        panel = self._floating_panels[key]
-        if panel.get("undocked"):
-            return
-        panel["frame"].lift()
-        self._drag_state[key] = {
-            "dx": event.x_root - (self.workspace.winfo_rootx() + panel["x"]),
-            "dy": event.y_root - (self.workspace.winfo_rooty() + panel["y"]),
-        }
-
-    def _drag_panel(self, key: str, event: tk.Event) -> None:
-        drag = self._drag_state.get(key)
-        if drag is None:
-            return
-        panel = self._floating_panels[key]
-        panel["x"] = event.x_root - self.workspace.winfo_rootx() - drag["dx"]
-        panel["y"] = event.y_root - self.workspace.winfo_rooty() - drag["dy"]
-        self._clamp_floating_panels()
-
-    def _on_workspace_resize(self, _event: tk.Event | None = None) -> None:
-        self._clamp_floating_panels()
-
-    def _set_panel_collapsed(self, key: str, collapsed: bool) -> None:
-        panel = self._floating_panels[key]
-        panel["collapsed"] = collapsed
-        if collapsed:
-            panel["content"].grid_remove()
-            panel["toggle_btn"].configure(text="▾")
-        else:
-            panel["content"].grid()
-            panel["toggle_btn"].configure(text="▴")
-        self._layout_floating_panels()
-
     def _refresh_panel_button_labels(self) -> None:
-        self.inspector_toggle_btn.configure(text="▾" if self._inspector_collapsed else "▴")
-        self.results_toggle_btn.configure(text="▾" if self._results_collapsed else "▴")
-        self.inspector_popout_btn.configure(text="↙" if self._floating_panels["inspector"].get("undocked") else "↗")
-        self.results_popout_btn.configure(text="↙" if self._floating_panels["results"].get("undocked") else "↗")
+        self.inspector_popout_btn.configure(text="↙" if self._panel_state["inspector"]["undocked"] else "↗")
+        self.results_popout_btn.configure(text="↙" if self._panel_state["results"]["undocked"] else "↗")
 
     def toggle_library_panel(self) -> None:
         self.status.set("Library is now available from the Insert menu")
-
-    def toggle_inspector_panel(self) -> None:
-        self._inspector_collapsed = not self._inspector_collapsed
-        self._set_panel_collapsed("inspector", self._inspector_collapsed)
-        self.status.set("Inspector panel expanded" if not self._inspector_collapsed else "Inspector panel collapsed")
-        self._refresh_panel_button_labels()
-
-    def toggle_results_panel(self) -> None:
-        self._results_collapsed = not self._results_collapsed
-        self._set_panel_collapsed("results", self._results_collapsed)
-        self.status.set("Results panel expanded" if not self._results_collapsed else "Results panel collapsed")
-        self._refresh_panel_button_labels()
 
     def toggle_library_popout(self) -> None:
         self.status.set("Library is now available from the Insert menu")
@@ -941,13 +832,13 @@ class HeatCircuitApp(ttk.Frame):
         self._library_popout = None
 
     def toggle_inspector_popout(self) -> None:
-        if self._floating_panels["inspector"].get("undocked"):
+        if self._panel_state["inspector"]["undocked"]:
             self._close_inspector_popout()
             self.status.set("Inspector redocked")
             return
 
-        self._floating_panels["inspector"]["undocked"] = True
-        self.inspector_frame.place_forget()
+        self._panel_state["inspector"]["undocked"] = True
+        self.side_tabs.tab(self.inspector_frame, state="hidden")
         self._inspector_popout = tk.Toplevel(self)
         self._inspector_popout.title("Inspector")
         self._inspector_popout.geometry("520x860")
@@ -983,21 +874,21 @@ class HeatCircuitApp(ttk.Frame):
     def _close_inspector_popout(self) -> None:
         if self._inspector_popout is not None and self._inspector_popout.winfo_exists():
             self._inspector_popout.destroy()
-        self._floating_panels["inspector"]["undocked"] = False
+        self._panel_state["inspector"]["undocked"] = False
+        self.side_tabs.tab(self.inspector_frame, state="normal")
         self._inspector_popout = None
         self._popup_inspector = None
         self._inspector_popup_host = None
-        self._layout_floating_panels()
         self._refresh_panel_button_labels()
 
     def toggle_results_popout(self) -> None:
-        if self._floating_panels["results"].get("undocked"):
+        if self._panel_state["results"]["undocked"]:
             self._close_results_popout()
             self.status.set("Results redocked")
             return
 
-        self._floating_panels["results"]["undocked"] = True
-        self.results_frame.place_forget()
+        self._panel_state["results"]["undocked"] = True
+        self.side_tabs.tab(self.results_frame, state="hidden")
         self._results_popout = tk.Toplevel(self)
         self._results_popout.title("Results")
         self._results_popout.geometry("760x540")
@@ -1019,11 +910,11 @@ class HeatCircuitApp(ttk.Frame):
     def _close_results_popout(self) -> None:
         if self._results_popout is not None and self._results_popout.winfo_exists():
             self._results_popout.destroy()
-        self._floating_panels["results"]["undocked"] = False
+        self._panel_state["results"]["undocked"] = False
+        self.side_tabs.tab(self.results_frame, state="normal")
         self._results_popout = None
         self._popup_results_text = None
         self._popup_results_scroll = None
-        self._layout_floating_panels()
         self._refresh_panel_button_labels()
 
 
