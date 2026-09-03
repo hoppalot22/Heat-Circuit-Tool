@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import unittest
 
 from heat_circuit_tool.model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
-from heat_circuit_tool.solver import analyze_constraint_system
+from heat_circuit_tool.persistence import _circuit_from_legacy_dict, circuit_from_dict, circuit_to_dict
+from heat_circuit_tool.solver import ThermoSolver, analyze_constraint_system
 from heat_circuit_tool.thermo import ThermoState
 
 
@@ -208,6 +209,144 @@ def build_sample_setups() -> list[SampleSetup]:
 
 
 class ConstraintSystemTests(unittest.TestCase):
+    def test_duplicate_component_ids_are_rejected(self) -> None:
+        circuit = Circuit()
+        first = Component(component_id="A", kind=ComponentKind.BOILER, process_kind=ProcessKind.ISOBARIC, name="A")
+        circuit.add_component(first)
+
+        with self.assertRaisesRegex(ValueError, "Duplicate component_id"):
+            circuit.add_component(Component(component_id="A", kind=ComponentKind.PUMP, process_kind=ProcessKind.ISENTROPIC, name="A2"))
+
+    def test_self_link_is_rejected(self) -> None:
+        circuit = Circuit()
+        make_component(circuit, "A", name="A")
+
+        with self.assertRaisesRegex(ValueError, "self-link"):
+            circuit.connect("A", "A")
+
+    def test_branch_connections_have_distinct_shared_edges(self) -> None:
+        circuit = Circuit()
+        source = make_component(circuit, "S", name="Source")
+        first = make_component(circuit, "A", name="First")
+        second = make_component(circuit, "B", name="Second")
+
+        circuit.connect("S", "A")
+        circuit.connect("S", "B")
+        circuit.connect("S", "B")
+
+        self.assertEqual(len(source.outlet_edge_ids), 2)
+        self.assertEqual(len(second.inlet_edge_ids), 1)
+        self.assertIs(circuit.outlet_edges(source)[0], circuit.inlet_edges(first)[0])
+        self.assertIs(circuit.outlet_edges(source)[1], circuit.inlet_edges(second)[0])
+
+    def test_removing_branch_component_cleans_shared_edge_references(self) -> None:
+        circuit = Circuit()
+        source = make_component(circuit, "S", name="Source")
+        first = make_component(circuit, "A", name="First")
+        second = make_component(circuit, "B", name="Second")
+        circuit.connect("S", "A")
+        circuit.connect("S", "B")
+
+        removed_edge_ids = set(first.inlet_edge_ids)
+        circuit.remove_component("A")
+
+        self.assertTrue(removed_edge_ids.isdisjoint(circuit.edges))
+        self.assertEqual(len(source.outlet_edge_ids), 1)
+        self.assertEqual(source.outlet_edge_ids, second.inlet_edge_ids)
+
+    def test_branch_edge_references_round_trip_through_persistence(self) -> None:
+        circuit = Circuit()
+        source = make_component(circuit, "S", name="Source")
+        first = make_component(circuit, "A", name="First")
+        second = make_component(circuit, "B", name="Second")
+        circuit.connect("S", "A")
+        circuit.connect("S", "B")
+
+        restored = circuit_from_dict(circuit_to_dict(circuit))
+
+        self.assertEqual(restored.components["S"].outlet_edge_ids, source.outlet_edge_ids)
+        self.assertEqual(restored.components["A"].inlet_edge_ids, first.inlet_edge_ids)
+        self.assertEqual(restored.components["B"].inlet_edge_ids, second.inlet_edge_ids)
+
+    def test_mixer_uses_mass_flow_weighted_pressure_and_enthalpy(self) -> None:
+        solver = ThermoSolver()
+        states = [
+            ThermoState(1.0, 100.0, 100.0, 1.0, 0.001),
+            ThermoState(2.0, 200.0, 300.0, 2.0, 0.002),
+        ]
+
+        mixed = solver._mix_states(states, [1.0, 3.0])
+
+        self.assertAlmostEqual(mixed.pressure_mpa, 1.0)
+        self.assertAlmostEqual(mixed.enthalpy_kj_kg, 250.0)
+
+    def test_mixer_falls_back_to_equal_weights_without_complete_flows(self) -> None:
+        solver = ThermoSolver()
+        states = [
+            ThermoState(1.0, 100.0, 100.0, 1.0, 0.001),
+            ThermoState(2.0, 200.0, 300.0, 2.0, 0.002),
+        ]
+
+        mixed = solver._mix_states(states, [1.0, None])
+
+        self.assertAlmostEqual(mixed.pressure_mpa, 1.0)
+        self.assertAlmostEqual(mixed.enthalpy_kj_kg, 200.0)
+
+    def test_outlet_defined_turbine_can_reverse_solve(self) -> None:
+        circuit = Circuit()
+        component = make_component(
+            circuit,
+            "T1",
+            name="Turbine",
+            kind=ComponentKind.TURBINE,
+            process_kind=ProcessKind.ISENTROPIC,
+            inlet_spec=ThermoSpec(pressure_mpa=15.0),
+            outlet_spec=ThermoSpec(pressure_mpa=3.0, temperature_c=250.0, efficiency=0.88),
+            user_input_fields={"inlet_pressure_mpa", "outlet_pressure_mpa", "outlet_temperature_c", "outlet_efficiency"},
+        )
+
+        results = ThermoSolver().propagate(circuit)
+
+        self.assertEqual(results[component.component_id].status, "Solved")
+        self.assertIsNotNone(results[component.component_id].inlet_state)
+
+    def test_legacy_migration_preserves_downstream_edge_metadata(self) -> None:
+        legacy = {
+            "start_component_id": "A",
+            "components": [
+                {
+                    "component_id": "A",
+                    "kind": "Boiler",
+                    "process_kind": "Isobaric",
+                    "name": "A",
+                    "upstream_ids": [],
+                    "downstream_ids": ["B"],
+                    "outlet_spec": {},
+                    "user_input_fields": [],
+                    "solved_fields": [],
+                    "conflicting_fields": [],
+                },
+                {
+                    "component_id": "B",
+                    "kind": "Boiler",
+                    "process_kind": "Isobaric",
+                    "name": "B",
+                    "upstream_ids": ["A"],
+                    "downstream_ids": [],
+                    "inlet_spec": {},
+                    "user_input_fields": [],
+                    "solved_fields": ["inlet_temperature_c"],
+                    "conflicting_fields": ["inlet_pressure_mpa"],
+                },
+            ],
+        }
+
+        circuit = _circuit_from_legacy_dict(legacy)
+        edge = circuit.outlet_edge(circuit.components["A"])
+
+        self.assertEqual(edge.solved_fields, {"temperature_c"})
+        self.assertEqual(edge.conflicting_fields, {"pressure_mpa"})
+
     def test_traversal_order_visits_breadth_first_then_disconnected_nodes(self) -> None:
         circuit = Circuit()
         for component_id, name in (("A", "A"), ("B", "B"), ("C", "C"), ("D", "D")):

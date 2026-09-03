@@ -156,6 +156,8 @@ class Component:
     downstream_ids: list[str] = field(default_factory=list)
     inlet_edge_id: str = ""
     outlet_edge_id: str = ""
+    inlet_edge_ids: list[str] = field(default_factory=list)
+    outlet_edge_ids: list[str] = field(default_factory=list)
     unit_preferences: dict[str, str] = field(default_factory=dict)
     inlet_definition_mode: str = "Auto"
     outlet_definition_mode: str = "Auto"
@@ -203,6 +205,8 @@ class Circuit:
     seed_description: str = ""
 
     def add_component(self, component: Component) -> None:
+        if component.component_id in self.components:
+            raise ValueError(f"Duplicate component_id '{component.component_id}' is not allowed.")
         self.components[component.component_id] = component
         if self.start_component_id is None:
             self.start_component_id = component.component_id
@@ -210,16 +214,26 @@ class Circuit:
             component.inlet_edge_id = f"{component.component_id}:inlet"
         if component.inlet_edge_id not in self.edges:
             self.edges[component.inlet_edge_id] = Edge(edge_id=component.inlet_edge_id)
+        if component.inlet_edge_id not in component.inlet_edge_ids:
+            component.inlet_edge_ids.insert(0, component.inlet_edge_id)
         if not component.outlet_edge_id:
             component.outlet_edge_id = f"{component.component_id}:outlet"
         if component.outlet_edge_id not in self.edges:
             self.edges[component.outlet_edge_id] = Edge(edge_id=component.outlet_edge_id)
+        if component.outlet_edge_id not in component.outlet_edge_ids:
+            component.outlet_edge_ids.insert(0, component.outlet_edge_id)
 
     def inlet_edge(self, component: Component) -> Edge:
         return self.edges.setdefault(component.inlet_edge_id, Edge(edge_id=component.inlet_edge_id))
 
     def outlet_edge(self, component: Component) -> Edge:
         return self.edges.setdefault(component.outlet_edge_id, Edge(edge_id=component.outlet_edge_id))
+
+    def inlet_edges(self, component: Component) -> list[Edge]:
+        return [self.edges[edge_id] for edge_id in component.inlet_edge_ids if edge_id in self.edges]
+
+    def outlet_edges(self, component: Component) -> list[Edge]:
+        return [self.edges[edge_id] for edge_id in component.outlet_edge_ids if edge_id in self.edges]
 
     def edge_for(self, component_id: str, side: str) -> Optional[Edge]:
         component = self.components.get(component_id)
@@ -239,34 +253,61 @@ class Circuit:
         component = self.components.pop(component_id, None)
         if component is None:
             return
+        removed_edge_ids = set(component.inlet_edge_ids) | set(component.outlet_edge_ids)
+        removed_edge_ids.update({component.inlet_edge_id, component.outlet_edge_id})
         for other in self.components.values():
             other.upstream_ids = [item for item in other.upstream_ids if item != component_id]
             other.downstream_ids = [item for item in other.downstream_ids if item != component_id]
-            if other.inlet_edge_id == component.outlet_edge_id:
+            other.inlet_edge_ids = [edge_id for edge_id in other.inlet_edge_ids if edge_id not in removed_edge_ids]
+            other.outlet_edge_ids = [edge_id for edge_id in other.outlet_edge_ids if edge_id not in removed_edge_ids]
+            if not other.inlet_edge_ids:
                 self._fresh_boundary_edge(other, "inlet")
-            if other.outlet_edge_id == component.inlet_edge_id:
+                other.inlet_edge_ids = [other.inlet_edge_id]
+            elif other.inlet_edge_id not in other.inlet_edge_ids:
+                other.inlet_edge_id = other.inlet_edge_ids[0]
+            if not other.outlet_edge_ids:
                 self._fresh_boundary_edge(other, "outlet")
-        self.edges.pop(component.inlet_edge_id, None)
-        self.edges.pop(component.outlet_edge_id, None)
+                other.outlet_edge_ids = [other.outlet_edge_id]
+            elif other.outlet_edge_id not in other.outlet_edge_ids:
+                other.outlet_edge_id = other.outlet_edge_ids[0]
+        for edge_id in removed_edge_ids:
+            self.edges.pop(edge_id, None)
         if self.start_component_id == component_id:
             self.start_component_id = next(iter(self.components), None)
 
     def connect(self, source_id: str, target_id: str) -> None:
         if source_id == target_id:
+            raise ValueError(f"Cannot create a self-link from '{source_id}' to itself.")
+        source = self.components.get(source_id)
+        target = self.components.get(target_id)
+        if source is None or target is None:
+            raise ValueError(f"Invalid connection endpoints: '{source_id}' -> '{target_id}'.")
+        if target_id in source.downstream_ids and source_id in target.upstream_ids:
             return
-        source = self.components[source_id]
-        target = self.components[target_id]
         if target_id not in source.downstream_ids:
             source.downstream_ids.append(target_id)
         if source_id not in target.upstream_ids:
             target.upstream_ids.append(source_id)
-        # Only merge into a single shared edge when this is the sole primary
-        # connection on both sides (mixers/splitters keep their own edges for
-        # secondary connections; see EDGE_STATE_REFACTOR_PLAN "Out of scope").
-        if len(source.downstream_ids) == 1 and len(target.upstream_ids) == 1:
-            if target.inlet_edge_id != source.outlet_edge_id:
+        if not source.outlet_edge_ids:
+            source.outlet_edge_ids.append(source.outlet_edge_id)
+        if not target.inlet_edge_ids:
+            target.inlet_edge_ids.append(target.inlet_edge_id)
+        if len(source.downstream_ids) == 1:
+            edge_id = source.outlet_edge_id
+        else:
+            edge_id = f"{source.component_id}:outlet:{target.component_id}"
+            if edge_id not in self.edges:
+                self.edges[edge_id] = Edge(edge_id=edge_id)
+            source.outlet_edge_ids.append(edge_id)
+        if len(target.upstream_ids) == 1:
+            if target.inlet_edge_id != edge_id:
                 self.edges.pop(target.inlet_edge_id, None)
-                target.inlet_edge_id = source.outlet_edge_id
+                target.inlet_edge_id = edge_id
+                target.inlet_edge_ids[0] = edge_id
+        else:
+            target.inlet_edge_ids.append(edge_id)
+        if edge_id not in source.outlet_edge_ids:
+            source.outlet_edge_ids.append(edge_id)
 
     def disconnect(self, source_id: str, target_id: str) -> None:
         source = self.components.get(source_id)
@@ -275,9 +316,22 @@ class Circuit:
             source.downstream_ids = [item for item in source.downstream_ids if item != target_id]
         if target:
             target.upstream_ids = [item for item in target.upstream_ids if item != source_id]
-        if source and target and source.outlet_edge_id == target.inlet_edge_id:
-            self._fresh_boundary_edge(source, "outlet")
-            self._fresh_boundary_edge(target, "inlet")
+        if source and target:
+            shared_ids = set(source.outlet_edge_ids) & set(target.inlet_edge_ids)
+            for edge_id in shared_ids:
+                source.outlet_edge_ids.remove(edge_id)
+                target.inlet_edge_ids.remove(edge_id)
+                self.edges.pop(edge_id, None)
+            if not source.outlet_edge_ids:
+                self._fresh_boundary_edge(source, "outlet")
+                source.outlet_edge_ids = [source.outlet_edge_id]
+            elif source.outlet_edge_id not in source.outlet_edge_ids:
+                source.outlet_edge_id = source.outlet_edge_ids[0]
+            if not target.inlet_edge_ids:
+                self._fresh_boundary_edge(target, "inlet")
+                target.inlet_edge_ids = [target.inlet_edge_id]
+            elif target.inlet_edge_id not in target.inlet_edge_ids:
+                target.inlet_edge_id = target.inlet_edge_ids[0]
 
     def outgoing(self, component_id: str) -> list[str]:
         component = self.components.get(component_id)
