@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from itertools import combinations
 from math import isclose, log10, pi
@@ -8,6 +9,18 @@ from typing import Optional
 from .model import Circuit, Component, ComponentKind, Edge, ProcessKind, ThermoSpec
 from .thermo import StateSpec, SteamPropertyBackend, ThermoState
 from .units import almost_equal
+
+_SPEC_FIELD_NAMES = [f.name for f in dataclasses.fields(ThermoSpec)]
+
+# Fields that a process kind conserves across a component regardless of whether
+# the full thermodynamic state can be resolved yet (e.g. isobaric outlet pressure
+# always equals inlet pressure, minus any user-specified pressure drop).
+_CONSERVED_FIELD_BY_PROCESS = {
+    ProcessKind.ISOBARIC: "pressure_mpa",
+    ProcessKind.ISOCHORIC: "specific_volume_m3_kg",
+    ProcessKind.ISENTHALPIC: "enthalpy_kj_kg",
+}
+_CONSERVATION_EXCLUDED_KINDS = {ComponentKind.PIPE, ComponentKind.MIXER, ComponentKind.SPLITTER}
 
 _PIPE_ONLY_FIELDS = {
     "heat_duty_kw",
@@ -149,39 +162,12 @@ class ThermoSolver:
         if circuit.seed_state is None:
             raise SolverError("Circuit needs a seed state before it can be solved.")
 
-        for component in circuit.components.values():
-            component.reset_results()
-        for edge in circuit.edges.values():
-            edge.state = None
-            edge.solved_fields.clear()
-            edge.conflicting_fields.clear()
-
         solution = CircuitSolution()
         order = circuit.traversal_order(circuit.start_component_id)
         if not order:
             raise SolverError("Circuit has no components to solve.")
 
-        results_by_id: dict[str, ComponentResult] = {}
-        for _ in range(20):
-            changed = False
-            for component in order:
-                inlet_state = self._resolve_inlet_state(circuit, component)
-                outlet_state_hint = self._resolve_outlet_state(circuit, component)
-                if inlet_state is None and outlet_state_hint is None:
-                    continue
-                inlet_edge = circuit.inlet_edge(component)
-                outlet_edge = circuit.outlet_edge(component)
-                previous_inlet = inlet_edge.state
-                previous_outlet = outlet_edge.state
-                result = self.solve_component(circuit, component, inlet_state, outlet_state_hint)
-                inlet_edge.state = result.inlet_state
-                outlet_edge.state = result.outlet_state
-                component.report = result.message
-                results_by_id[component.component_id] = result
-                if self._state_changed(previous_inlet, inlet_edge.state) or self._state_changed(previous_outlet, outlet_edge.state):
-                    changed = True
-            if not changed:
-                break
+        results_by_id = self.propagate(circuit, reset=True)
 
         for component in order:
             result = results_by_id.get(component.component_id)
@@ -205,43 +191,149 @@ class ThermoSolver:
         self._evaluate_connectivity(circuit, solution)
         return solution
 
+    def propagate(self, circuit: Circuit, reset: bool = True) -> dict[str, ComponentResult]:
+        """Run a forward/backward fixed-point propagation pass across the whole circuit.
+
+        Unlike `solve_circuit`, this does not require a seed state or start component
+        and never raises for components that cannot yet be solved (they are simply
+        skipped). This lets a single field edit cascade to every component whose
+        state is now derivable, not just the one that was just edited.
+        """
+        if reset:
+            for component in circuit.components.values():
+                component.reset_results()
+            for edge in circuit.edges.values():
+                for field_name in _SPEC_FIELD_NAMES:
+                    if field_name not in edge.user_input_fields:
+                        setattr(edge.spec, field_name, None)
+                edge.state = None
+                edge.solved_fields.clear()
+                edge.conflicting_fields.clear()
+
+        order = circuit.traversal_order(circuit.start_component_id) if circuit.components else []
+        results_by_id: dict[str, ComponentResult] = {}
+        for _ in range(20):
+            changed, blocked_ids = self._infer_conserved_fields(circuit, results_by_id)
+            for component in order:
+                if component.component_id in blocked_ids:
+                    continue
+                inlet_state = self._resolve_inlet_state(circuit, component)
+                outlet_state_hint = self._resolve_outlet_state(circuit, component)
+                if inlet_state is None and outlet_state_hint is None:
+                    continue
+                inlet_edge = circuit.inlet_edge(component)
+                outlet_edge = circuit.outlet_edge(component)
+                previous_inlet = inlet_edge.state
+                previous_outlet = outlet_edge.state
+                try:
+                    result = self.solve_component(circuit, component, inlet_state, outlet_state_hint)
+                except SolverError:
+                    continue
+                inlet_edge.state = result.inlet_state
+                outlet_edge.state = result.outlet_state
+                for connection_edge in circuit.outlet_edges(component):
+                    if connection_edge is outlet_edge or connection_edge.user_input_fields:
+                        continue
+                    connection_edge.state = result.outlet_state
+                component.report = result.message
+                results_by_id[component.component_id] = result
+                if self._state_changed(previous_inlet, inlet_edge.state) or self._state_changed(previous_outlet, outlet_edge.state):
+                    changed = True
+            if not changed:
+                break
+        return results_by_id
+
+    def _infer_conserved_fields(
+        self, circuit: Circuit, results_by_id: dict[str, ComponentResult]
+    ) -> tuple[bool, set[str]]:
+        """Carry a process-conserved field (e.g. isobaric pressure) across a component.
+
+        This works even when neither side has enough properties yet for a full
+        thermodynamic state, so a single user-defined field can light up its
+        conserved counterpart on the other side of the same component immediately.
+        If both sides are already defined and disagree, the component is flagged
+        Overconstrained and returned in `blocked_ids` so the caller skips solving
+        it (and anything depending solely on it) until the conflict is resolved.
+        """
+        changed = False
+        blocked_ids: set[str] = set()
+        for component in circuit.components.values():
+            if component.kind in _CONSERVATION_EXCLUDED_KINDS:
+                continue
+            field_name = _CONSERVED_FIELD_BY_PROCESS.get(component.process_kind)
+            if field_name is None:
+                continue
+            inlet_edge = circuit.inlet_edge(component)
+            outlet_edge = circuit.outlet_edge(component)
+            inlet_value = getattr(inlet_edge.spec, field_name)
+            outlet_value = getattr(outlet_edge.spec, field_name)
+            drop = outlet_edge.spec.pressure_drop_mpa or 0.0 if field_name == "pressure_mpa" else 0.0
+            if inlet_value is not None and outlet_value is not None:
+                expected_outlet = inlet_value - drop
+                if not isclose(expected_outlet, outlet_value, rel_tol=1e-6, abs_tol=1e-6):
+                    inlet_edge.conflicting_fields.add(field_name)
+                    outlet_edge.conflicting_fields.add(field_name)
+                    blocked_ids.add(component.component_id)
+                    message = (
+                        f"{component.name}: inlet and outlet {field_name} disagree for a "
+                        f"{component.process_kind.value} process (expected outlet={expected_outlet:.4g}, "
+                        f"got {outlet_value:.4g})."
+                    )
+                    component.report = message
+                    component.is_dirty = False
+                    results_by_id[component.component_id] = ComponentResult(
+                        component_id=component.component_id,
+                        component_name=component.name,
+                        kind=component.kind,
+                        process_kind=component.process_kind,
+                        inlet_state=None,
+                        outlet_state=None,
+                        status="Overconstrained",
+                        conflicting_fields=[f"inlet_{field_name}", f"outlet_{field_name}"],
+                        message=message,
+                    )
+                continue
+            if inlet_value is not None and outlet_value is None:
+                setattr(outlet_edge.spec, field_name, inlet_value - drop)
+                outlet_edge.solved_fields.add(field_name)
+                component.is_dirty = False
+                changed = True
+            elif outlet_value is not None and inlet_value is None:
+                setattr(inlet_edge.spec, field_name, outlet_value + drop)
+                inlet_edge.solved_fields.add(field_name)
+                component.is_dirty = False
+                changed = True
+        return changed, blocked_ids
+
     def _resolve_inlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
         inlet_edge = circuit.inlet_edge(component)
         user_inlet = self._state_from_thermo_spec(inlet_edge.spec)
         if user_inlet is not None:
             return user_inlet
-        upstream_states: list[ThermoState] = []
-        for upstream_id in circuit.incoming(component.component_id):
-            upstream = circuit.components.get(upstream_id)
-            if upstream is not None:
-                upstream_outlet_state = circuit.outlet_edge(upstream).state
-                if upstream_outlet_state is not None:
-                    upstream_states.append(upstream_outlet_state)
+        inlet_edges = circuit.inlet_edges(component)
+        upstream_states = [edge.state for edge in inlet_edges if edge.state is not None]
         if not upstream_states:
             if component.component_id == circuit.start_component_id and circuit.seed_state is not None:
                 return circuit.seed_state
             return None
         if len(upstream_states) == 1:
             return upstream_states[0]
-        return self._mix_states(upstream_states)
+        upstream_weights = [edge.spec.mass_flow_kg_s for edge in inlet_edges if edge.state is not None]
+        return self._mix_states(upstream_states, upstream_weights)
 
     def _resolve_outlet_state(self, circuit: Circuit, component: Component) -> ThermoState | None:
         outlet_edge = circuit.outlet_edge(component)
         user_outlet = self._state_from_thermo_spec(outlet_edge.spec)
         if user_outlet is not None:
             return user_outlet
-        downstream_states: list[ThermoState] = []
-        for downstream_id in circuit.outgoing(component.component_id):
-            downstream = circuit.components.get(downstream_id)
-            if downstream is not None:
-                downstream_inlet_state = circuit.inlet_edge(downstream).state
-                if downstream_inlet_state is not None:
-                    downstream_states.append(downstream_inlet_state)
+        outlet_edges = circuit.outlet_edges(component)
+        downstream_states = [edge.state for edge in outlet_edges if edge.state is not None]
         if not downstream_states:
             return None
         if len(downstream_states) == 1:
             return downstream_states[0]
-        return self._mix_states(downstream_states)
+        downstream_weights = [edge.spec.mass_flow_kg_s for edge in outlet_edges if edge.state is not None]
+        return self._mix_states(downstream_states, downstream_weights)
 
     def _state_from_thermo_spec(self, spec: ThermoSpec) -> ThermoState | None:
         full = spec.to_state_spec()
@@ -289,9 +381,26 @@ class ThermoSolver:
                 return False
         return True
 
-    def _mix_states(self, states: list[ThermoState]) -> ThermoState:
-        mean_pressure = sum(state.pressure_mpa for state in states) / len(states)
-        mean_enthalpy = sum(state.enthalpy_kj_kg for state in states) / len(states)
+    def _mix_states(self, states: list[ThermoState], weights: list[float | None] | None = None) -> ThermoState:
+        """Return a common-pressure mixture state with mass-weighted enthalpy.
+
+        A real mixer cannot gain pressure by averaging inlet pressures. The
+        lowest inlet pressure is therefore used as the common outlet pressure;
+        any configured mixer pressure drop is applied by the component solver.
+        Enthalpy is conserved across the adiabatic mixing step.
+        """
+        usable_weights = (
+            [weight for weight in weights if weight is not None and weight > 0.0]
+            if weights is not None
+            else []
+        )
+        if weights is not None and len(usable_weights) == len(states):
+            total_weight = sum(usable_weights)
+            normalized_weights = [weight / total_weight for weight in usable_weights]
+        else:
+            normalized_weights = [1.0 / len(states)] * len(states)
+        mean_pressure = min(state.pressure_mpa for state in states)
+        mean_enthalpy = sum(state.enthalpy_kj_kg * weight for state, weight in zip(states, normalized_weights))
         try:
             return self.backend.state_from_pressure_enthalpy(mean_pressure, mean_enthalpy)
         except Exception:
@@ -321,13 +430,7 @@ class ThermoSolver:
     def _evaluate_closure(self, circuit: Circuit, solution: CircuitSolution) -> None:
         if circuit.start_component_id is None:
             return
-        returning_states: list[ThermoState] = []
-        for upstream_id in circuit.incoming(circuit.start_component_id):
-            upstream = circuit.components.get(upstream_id)
-            if upstream is not None:
-                upstream_outlet_state = circuit.outlet_edge(upstream).state
-                if upstream_outlet_state is not None:
-                    returning_states.append(upstream_outlet_state)
+        returning_states = [edge.state for edge in circuit.inlet_edges(circuit.components[circuit.start_component_id]) if edge.state is not None]
         if not returning_states:
             return
         loop_return = self._mix_states(returning_states)
@@ -475,14 +578,16 @@ class ThermoSolver:
     def _solve_component_reverse(
         self,
         component: Component,
+        inlet_spec: ThermoSpec,
+        outlet_spec: ThermoSpec,
         outlet_state: ThermoState,
     ) -> tuple[ThermoState, ThermoState, float, float, str]:
         process = component.process_kind
         if process == ProcessKind.ISENTHALPIC:
-            inlet_state = self._reverse_isenthalpic_component(component, outlet_state)
+            inlet_state = self._reverse_isenthalpic_component(component, inlet_spec, outlet_spec, outlet_state)
             return inlet_state, outlet_state, 0.0, 0.0, "Solved from outlet state (reverse isenthalpic)."
         if process == ProcessKind.ADIABATIC and component.kind not in {ComponentKind.TURBINE, ComponentKind.PUMP}:
-            inlet_state = self._reverse_isenthalpic_component(component, outlet_state)
+            inlet_state = self._reverse_isenthalpic_component(component, inlet_spec, outlet_spec, outlet_state)
             return inlet_state, outlet_state, 0.0, 0.0, "Solved from outlet state (reverse adiabatic/isenthalpic)."
         if process in {ProcessKind.ISENTROPIC, ProcessKind.ADIABATIC} and component.kind in {
             ComponentKind.TURBINE,

@@ -1,13 +1,17 @@
-# Refactor Plan: Edge-Owned Thermodynamic State
+# Completed Plan: Edge-Owned Thermodynamic State
 
 ## Status
-Complete. Implemented across `model.py`, `solver.py`, `persistence.py` (with a
+Completed. Implemented across `model.py`, `solver.py`, `persistence.py` (with a
 version-2 migration path for legacy save files), `presets.py`,
 `solve_logging.py`, `demo.py`, and the UI layer (`inspector.py`, `canvas.py`,
 `main_window.py`). `tests/test_constraint_system.py` was updated to build
 circuits via `circuit.connect(...)` and configure edges directly. All existing
-tests pass, plus manual verification of solving, save/load round-trips, legacy
+  tests pass, plus manual verification of solving, save/load round-trips, legacy
 migration, and shared-edge propagation between connected components.
+
+This plan is complete and superseded by
+`docs/POST_REFACTOR_ROADMAP.md`, which covers multi-port UI, end-to-end
+validation, and further thermodynamic model improvements.
 
 ## Problem statement
 Today, thermodynamic state is duplicated per component: each `Component` owns
@@ -66,10 +70,9 @@ UI widgets for the currently selected component (see below).
 `Component` changes:
 - Remove `inlet_spec`, `outlet_spec`, `inlet_state`, `outlet_state`,
   `user_input_fields`, `solved_fields`, `conflicting_fields`.
-- Add `inlet_edge_id: str | None` and `outlet_edge_id: str | None` (single
-  inlet/outlet edge per component, matching today's `upstream_id`/
-  `downstream_id` single-connection model — mixers/splitters are out of scope
-  for this refactor, see "Out of scope" below).
+- Add primary `inlet_edge_id: str | None` and `outlet_edge_id: str | None`,
+  plus edge-ID lists for components with multiple incoming or outgoing
+  connections.
 - Keep `inlet_definition_mode` / `outlet_definition_mode` and
   `unit_preferences` for now (unit prefs could move to the edge later, but
   that's a separate concern — a component could reasonably want to view the
@@ -79,8 +82,9 @@ UI widgets for the currently selected component (see below).
 `Circuit` changes:
 - Add `edges: dict[str, Edge]`.
 - `connect(source_id, target_id)`: instead of only recording
-  `upstream_ids`/`downstream_ids`, create (or reuse) an `Edge` and set
-  `source.outlet_edge_id = target.inlet_edge_id = edge.edge_id`.
+  `upstream_ids`/`downstream_ids`, create (or reuse) a shared `Edge`, retain
+  primary edge IDs for the inspector, and track secondary connection edges in
+  the corresponding edge-ID lists.
 - `disconnect(source_id, target_id)`: clear the shared edge reference on both
   sides. Decide whether to delete the `Edge` object outright (simplest) or
   leave it orphaned. Deleting is cleaner and avoids stale data resurrecting
@@ -110,13 +114,10 @@ UI widgets for the currently selected component (see below).
   reads of the edge's `spec` via `circuit.edge_for(component.component_id, "inlet"/"outlet")`.
 - Replace all reads/writes of `component.inlet_state` / `component.outlet_state`
   with the edge's `state`.
-- `_resolve_inlet_state`/`_resolve_outlet_state`: since inlet and outlet are
-  now literally the same edge object as the neighbor's outlet/inlet, these
-  methods can likely be simplified — resolving "the inlet state" becomes
-  "read `edge.state` if already solved, else derive from `edge.spec` if it has
-  ≥2 defined fields, else `None`". The mixing logic for multiple incoming
-  connections (mixers) still needs multiple edges per component — see
-  "Out of scope".
+- `_resolve_inlet_state`/`_resolve_outlet_state`: resolve primary edge specs
+  directly and inspect all connection edges for multi-port components. Mixer
+  inlet states use the common-pressure, mass-flow-weighted enthalpy model
+  described in the follow-up considerations below.
 - `_diagnostic_overconstraint_flags` / `_diagnostic_missing_fields`: field
   counts should be computed per-edge (once) rather than per-component-side.
   This is where the "is this component's process overconstrained" check
@@ -229,17 +230,14 @@ UI widgets for the currently selected component (see below).
   - Overconstraint detection still fires correctly for a non-General
     component with a fully-defined inlet edge and fully-defined outlet edge.
 
-## Out of scope for this pass
-- Mixers/splitters with multiple inlet or outlet connections. Today
-  `upstream_ids`/`downstream_ids` are lists but only `[0]` is used for
-  traversal (`ordered_path`), and mixing logic (`_mix_states`) already
-  handles combining multiple upstream states into one value. For this
-  refactor, keep `inlet_edge_id`/`outlet_edge_id` as single references for
-  most component kinds, but `Circuit` should still support a component having
-  multiple *incoming* edges by tracking them separately from the "primary"
-  inlet edge used for spec entry (mirroring today's `upstream_ids` list vs.
-  `upstream_id` singular property). Do not attempt to unify mixer semantics
-  in this pass — just don't regress current mixer behavior.
+## Follow-up considerations
+- Mixer and splitter connections now have distinct shared edges per connection,
+  while `inlet_edge_id`/`outlet_edge_id` remain the primary inspector-facing
+  edges. The solver reads all incoming edges for mixing and fans solved outlet
+  state out across branch edges. Mixer pressure uses the lowest inlet pressure
+  and enthalpy uses complete positive mass-flow weights, with equal weighting as
+  the fallback when branch flow data is incomplete. Future work can add
+  dedicated multi-port UI controls.
 - Moving `seed_state`/`seed_description` onto an edge (kept as a `Circuit`
   field for now, see above).
 - Changing `unit_preferences` to live per-edge instead of per-component.

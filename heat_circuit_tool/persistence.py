@@ -125,6 +125,8 @@ def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
                 "downstream_ids": list(component.downstream_ids),
                 "inlet_edge_id": component.inlet_edge_id,
                 "outlet_edge_id": component.outlet_edge_id,
+                "inlet_edge_ids": list(component.inlet_edge_ids),
+                "outlet_edge_ids": list(component.outlet_edge_ids),
                 "unit_preferences": dict(component.unit_preferences),
                 "inlet_definition_mode": component.inlet_definition_mode,
                 "outlet_definition_mode": component.outlet_definition_mode,
@@ -167,6 +169,8 @@ def circuit_from_dict(data: dict[str, Any]) -> Circuit:
             downstream_ids=list(item.get("downstream_ids", [])),
             inlet_edge_id=item.get("inlet_edge_id", ""),
             outlet_edge_id=item.get("outlet_edge_id", ""),
+            inlet_edge_ids=list(item.get("inlet_edge_ids", [])),
+            outlet_edge_ids=list(item.get("outlet_edge_ids", [])),
             unit_preferences=dict(item.get("unit_preferences", {})),
             inlet_definition_mode=item.get("inlet_definition_mode", "Auto"),
             outlet_definition_mode=item.get("outlet_definition_mode", "Auto"),
@@ -268,6 +272,8 @@ def _circuit_from_legacy_dict(data: dict[str, Any]) -> Circuit:
             if shared_edge is downstream_edge:
                 continue
             merged_user_fields = shared_edge.user_input_fields | downstream_edge.user_input_fields
+            merged_solved_fields = shared_edge.solved_fields | downstream_edge.solved_fields
+            merged_conflicting_fields = shared_edge.conflicting_fields | downstream_edge.conflicting_fields
             for attr in _THERMO_SPEC_FIELD_NAMES:
                 downstream_value = getattr(downstream_edge.spec, attr)
                 if downstream_value is None:
@@ -276,9 +282,15 @@ def _circuit_from_legacy_dict(data: dict[str, Any]) -> Circuit:
                 if upstream_value is None or (attr in downstream_edge.user_input_fields and attr not in shared_edge.user_input_fields):
                     setattr(shared_edge.spec, attr, downstream_value)
             shared_edge.user_input_fields = merged_user_fields
+            shared_edge.solved_fields = merged_solved_fields
+            shared_edge.conflicting_fields = merged_conflicting_fields
             shared_edge.state = shared_edge.state or downstream_edge.state
             circuit.edges.pop(downstream.inlet_edge_id, None)
             downstream.inlet_edge_id = shared_edge.edge_id
+            downstream.inlet_edge_ids = [
+                shared_edge.edge_id if edge_id == downstream_edge.edge_id else edge_id
+                for edge_id in downstream.inlet_edge_ids
+            ]
 
     return circuit
 

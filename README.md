@@ -6,6 +6,7 @@ Heat Circuit Tool is a modular desktop app for creating, connecting, and solving
 
 - Developer docs index: docs/README.md
 - Full Python API reference: docs/PYTHON_API_REFERENCE.md
+- Post-refactor roadmap: docs/POST_REFACTOR_ROADMAP.md
 
 It is designed so you can:
 - Build a flowsheet visually using draggable component blocks.
@@ -187,8 +188,16 @@ The demo is configured as a realistic forward-solved reheat Rankine setup with f
 ## 11. Current modeling assumptions
 
 - Steam properties use IAPWS97.
-- Merge nodes currently use mixed inlet state approximation at averaged pressure/enthalpy when multiple upstream states are present.
-- Advanced branch mass flow split equations are not yet exposed in the UI.
+- Each connection owns one shared edge state; branched connections have distinct
+	edges and are propagated independently.
+- Mixers use the lowest inlet pressure as the common outlet pressure and
+	conserve enthalpy using positive branch mass-flow weights when all flows are
+	available. Equal enthalpy weighting is used when branch flow data is
+	incomplete.
+- Mixer pressure drop can be specified at the outlet and is applied after the
+	incoming states are mixed.
+- Branch mass-flow split equations and dedicated multi-port editing controls
+	are not yet exposed in the UI.
 
 ## 12. Troubleshooting
 

@@ -5,7 +5,7 @@ import platform
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Optional
+from typing import Optional, cast
 
 from ..demo import build_reheat_rankine_demo
 from ..model import Circuit, Component, ComponentKind, ProcessKind, ThermoSpec
@@ -20,15 +20,16 @@ from ..unit_system import default_unit
 
 
 class HeatCircuitApp(ttk.Frame):
-    def __init__(self, master: tk.Misc):
+    def __init__(self, master: tk.Tk):
         super().__init__(master)
-        self.master.title("Heat Circuit Tool")
-        screen_w = max(int(self.master.winfo_screenwidth()), 800)
-        screen_h = max(int(self.master.winfo_screenheight()), 600)
+        self._root = master
+        self._root.title("Heat Circuit Tool")
+        screen_w = max(int(self._root.winfo_screenwidth()), 800)
+        screen_h = max(int(self._root.winfo_screenheight()), 600)
         launch_w = max(screen_w // 2, 480)
         launch_h = max(screen_h // 2, 320)
-        self.master.geometry(f"{launch_w}x{launch_h}")
-        self.master.minsize(480, 320)
+        self._root.geometry(f"{launch_w}x{launch_h}")
+        self._root.minsize(480, 320)
         self.circuit = build_reheat_rankine_demo()
         self._selection_id: Optional[str] = None
         self._latest_solved_snapshot: dict | None = None
@@ -96,7 +97,7 @@ class HeatCircuitApp(ttk.Frame):
         return str(project.with_name(base_name + ".solve_log.jsonl"))
 
     def _build_style(self) -> None:
-        style = ttk.Style(self.master)
+        style = ttk.Style(self._root)
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -299,7 +300,7 @@ class HeatCircuitApp(ttk.Frame):
         self._update_live_diagnostics()
 
     def _build_insert_menu(self) -> None:
-        menu_bar = tk.Menu(self.master)
+        menu_bar = tk.Menu(self._root)
         insert_menu = tk.Menu(menu_bar, tearoff=0)
         insert_menu.add_command(label="Pump", command=lambda: self.add_component(ComponentKind.PUMP, ProcessKind.ISENTROPIC))
         insert_menu.add_command(label="Boiler", command=lambda: self.add_component(ComponentKind.BOILER, ProcessKind.ISOBARIC))
@@ -319,7 +320,7 @@ class HeatCircuitApp(ttk.Frame):
         insert_menu.add_cascade(label="Preset", menu=presets_menu)
 
         menu_bar.add_cascade(label="Insert", menu=insert_menu)
-        self.master.configure(menu=menu_bar)
+        self._root.configure(menu=menu_bar)
 
     def refresh_all(self) -> None:
         self.canvas.redraw()
@@ -345,6 +346,9 @@ class HeatCircuitApp(ttk.Frame):
     def add_component(self, kind: ComponentKind, process: ProcessKind) -> None:
         index = len(self.circuit.components) + 1
         component_id = f"N{index}"
+        while component_id in self.circuit.components:
+            index += 1
+            component_id = f"N{index}"
         default_outlet_spec = ThermoSpec(efficiency=0.85 if kind in {ComponentKind.PUMP, ComponentKind.TURBINE} else None)
         if kind == ComponentKind.PIPE:
             default_outlet_spec = ThermoSpec(
@@ -379,6 +383,9 @@ class HeatCircuitApp(ttk.Frame):
             return
         index = len(self.circuit.components) + 1
         component_id = f"N{index}"
+        while component_id in self.circuit.components:
+            index += 1
+            component_id = f"N{index}"
         base = PRESETS[preset_name]
         component = Component(
             component_id=component_id,
@@ -410,7 +417,6 @@ class HeatCircuitApp(ttk.Frame):
         if self._popup_inspector is not None:
             self._popup_inspector.apply_to_component()
         self.inspector.apply_to_component()
-        self._prepare_circuit_for_user_constrained_solve()
         self._last_solver_error = None
         try:
             solution = solve_circuit(self.circuit)
@@ -467,55 +473,6 @@ class HeatCircuitApp(ttk.Frame):
         else:
             self.status.set("Circuit solved successfully")
 
-    def _prepare_circuit_for_user_constrained_solve(self) -> None:
-        # Remove any solver-populated values so each solve uses only current user constraints.
-        inlet_fields = [
-            "pressure_mpa",
-            "temperature_c",
-            "enthalpy_kj_kg",
-            "entropy_kj_kgk",
-            "quality",
-            "specific_volume_m3_kg",
-            "efficiency",
-        ]
-        outlet_fields = [
-            "pressure_mpa",
-            "temperature_c",
-            "enthalpy_kj_kg",
-            "entropy_kj_kgk",
-            "quality",
-            "specific_volume_m3_kg",
-            "efficiency",
-            "heat_duty_kw",
-            "pressure_drop_mpa",
-            "mass_flow_kg_s",
-            "pipe_length_m",
-            "pipe_outer_diameter_m",
-            "pipe_wall_thickness_m",
-            "pipe_roughness_m",
-            "elevation_change_m",
-            "local_loss_coefficient",
-        ]
-
-        for component in self.circuit.components.values():
-            inlet_edge = self.circuit.inlet_edge(component)
-            outlet_edge = self.circuit.outlet_edge(component)
-            for field_name in inlet_fields:
-                if field_name not in inlet_edge.user_input_fields:
-                    setattr(inlet_edge.spec, field_name, None)
-            for field_name in outlet_fields:
-                if field_name not in outlet_edge.user_input_fields:
-                    setattr(outlet_edge.spec, field_name, None)
-
-            inlet_edge.state = None
-            outlet_edge.state = None
-            component.report = ""
-            inlet_edge.solved_fields.clear()
-            outlet_edge.solved_fields.clear()
-            inlet_edge.conflicting_fields.clear()
-            outlet_edge.conflicting_fields.clear()
-            component.is_dirty = True
-
     def _on_inspector_apply(self) -> None:
         self._solve_selected_component_preview()
         self.canvas.redraw()
@@ -532,39 +489,32 @@ class HeatCircuitApp(ttk.Frame):
     def _solve_selected_component_preview(self) -> None:
         if self._selection_id is None:
             return
-        component = self.circuit.components.get(self._selection_id)
-        if component is None:
+        if self._selection_id not in self.circuit.components:
             return
 
         solver = ThermoSolver()
-        inlet_state = solver._resolve_inlet_state(self.circuit, component)
-        outlet_hint = solver._resolve_outlet_state(self.circuit, component)
-        if inlet_state is None and outlet_hint is None:
-            return
-
         try:
-            result = solver.solve_component(self.circuit, component, inlet_state, outlet_hint)
-        except SolverError:
-            return
+            results_by_id = solver.propagate(self.circuit)
         except Exception:
             return
 
-        self.circuit.inlet_edge(component).state = result.inlet_state
-        self.circuit.outlet_edge(component).state = result.outlet_state
-        component.report = result.message
-        self.inspector.apply_solution_to_component(
-            result.component_id,
-            result.inlet_state,
-            result.outlet_state,
-            conflicting_fields=result.conflicting_fields,
-        )
-        if self._popup_inspector is not None:
-            self._popup_inspector.apply_solution_to_component(
+        # Propagation cascades to every component whose state is now derivable
+        # (not just the selected one), so a downstream reheater etc. picks up
+        # values that became indirectly known from the edited constraints.
+        for result in results_by_id.values():
+            self.inspector.apply_solution_to_component(
                 result.component_id,
                 result.inlet_state,
                 result.outlet_state,
                 conflicting_fields=result.conflicting_fields,
             )
+            if self._popup_inspector is not None:
+                self._popup_inspector.apply_solution_to_component(
+                    result.component_id,
+                    result.inlet_state,
+                    result.outlet_state,
+                    conflicting_fields=result.conflicting_fields,
+                )
 
     def _on_inspector_dirty(self) -> None:
         self.status.set("Model modified: solve required")
@@ -754,7 +704,7 @@ class HeatCircuitApp(ttk.Frame):
         widget_name = str(widget)
         return any(str(pane_item) == widget_name for pane_item in pane.panes())
 
-    def _bind_recursive(self, widget: tk.Widget, sequence: str, callback) -> None:
+    def _bind_recursive(self, widget: tk.Misc, sequence: str, callback) -> None:
         widget.bind(sequence, callback, add="+")
         for child in widget.winfo_children():
             self._bind_recursive(child, sequence, callback)
@@ -796,7 +746,7 @@ class HeatCircuitApp(ttk.Frame):
             pointer_x, pointer_y = self.winfo_pointerxy()
         except tk.TclError:
             return None
-        return self.winfo_containing(pointer_x, pointer_y)
+        return cast(tk.Widget | None, self.winfo_containing(pointer_x, pointer_y))
 
     def _is_descendant_of(self, widget: tk.Widget | None, ancestor: tk.Widget) -> bool:
         if widget is None:
